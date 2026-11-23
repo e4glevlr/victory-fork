@@ -344,6 +344,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_KEYS_FILE=<file>` | presses each key (`Enter`, or `Enter 0.5` to hold it half a second) appended to the file as a line, in order and 0.6 s apart (the title's menus ignore quicker presses), focus or not |
+| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`); a file named `now` put in the folder saves the next frame |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
@@ -361,8 +362,19 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+Every build appends unhandled exceptions, panics, and host GPU failures to
+`crashes.log` in the title's data folder.
+
+For a startup breakpoint (`0x80000003`), run the diagnostics build with
+`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`crashes.log` entries. A host DLL refusal includes the caller stack in the
+console output. The refusal is expected for DLLs outside the host policy.
+
+To compare hardware and software rendering, repeat with
+`VICTORY_D3D12_WARP=1` and check the console for
+`host device on the software adapter (WARP)` to confirm the WARP device was
+created. Compare the exception's module and offset, stack frames, and
+preceding messages across the two runs.
 
 ### Unattended runs
 
