@@ -370,6 +370,11 @@ For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `crashes.log` entries. A host DLL refusal includes the caller stack in the
 console output. The refusal is expected for DLLs outside the host policy.
 
+On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+`+0x2237178` before the first window. Restore the archive from the same
+package beside the title executable. `run --execute` checks that it can
+read the RPF9 header before starting this build.
+
 To compare hardware and software rendering, repeat with
 `VICTORY_D3D12_WARP=1` and check the console for
 `host device on the software adapter (WARP)` to confirm the WARP device was
