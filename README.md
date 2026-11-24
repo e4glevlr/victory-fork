@@ -339,6 +339,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_KEYS_FILE=<file>` | presses each key (`Enter`, or `Enter 0.5` to hold it half a second) appended to the file as a line, in order and 0.6 s apart (the title's menus ignore quicker presses), focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
