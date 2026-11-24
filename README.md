@@ -239,6 +239,13 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
+Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
+top-level window to that bounding box. Smaller windows keep their size,
+larger windows keep their proportions, and the monitor's work area still
+limits them. This scales the displayed image; it does not change the
+console render resolution or the swap-chain buffers. With the variable
+unset, window sizing is unchanged.
+
 Input: XInput pads, and keyboard and mouse played like a PC game. The title
 reads pads only, so the keyboard and mouse act on the first connected pad (or
 a stand-in pad when none is): both work at once, each stick follows whichever
