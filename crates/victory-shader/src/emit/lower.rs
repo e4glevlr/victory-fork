@@ -10215,8 +10215,11 @@ impl<'a> Lower<'a> {
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    // omod and clamp are part of the f16 instruction; op_sel[3]
+                    // picks the destination half.
+                    let f = self.half_modifiers(inst, f);
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -10348,6 +10351,23 @@ impl<'a> Lower<'a> {
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
         self.s.m.bin(c, Bin::Or, old, x)
+    }
+
+    /// VOP3 f16 output modifiers on the result still in f32: omod, then
+    /// clamp (the order `write_f` uses), so the half conversion rounds once.
+    fn half_modifiers(&mut self, inst: &Inst, mut f: V) -> V {
+        let Fields::Valu(v) = &inst.fields else {
+            return f;
+        };
+        if v.omod != 0 {
+            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+            let k = self.s.m.f32(factor.to_bits());
+            f = self.s.m.bin(self.cur, Bin::Mul, f, k);
+        }
+        if v.clamp {
+            f = self.unary(7, f);
+        }
+        f
     }
 
     /// The direction a cube sample's face coordinates stand for: the
