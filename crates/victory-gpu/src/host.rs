@@ -670,6 +670,8 @@ fn create() -> windows::core::Result<Host> {
         } else {
             let adapter = chosen_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
+            crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
