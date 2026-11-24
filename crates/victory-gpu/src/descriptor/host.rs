@@ -1240,8 +1240,12 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -4466,5 +4470,25 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+
+    /// Contiguous free dynamic slot ranges that cross the search cursor are found.
+    #[test]
+    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+        let Some(heap) = super::HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Allocate slots 0..8, advancing cursor to 8.
+        let a = heap.dynamic(8).unwrap();
+        // Allocate slots 8..16, advancing cursor to 16.
+        let b = heap.dynamic(8).unwrap();
+        assert_eq!((a, b), (4, 12));
+
+        // Release slots 10..14 (crossing cursor at 12).
+        // Before the fix, a request of 4 slots starting search at 12 scanned 12..end then 0..12,
+        // missing the contiguous run at 10..14.
+        heap.release(14, 4);
+        let c = heap.dynamic(4);
+        assert_eq!(c, Some(14));
     }
 }
