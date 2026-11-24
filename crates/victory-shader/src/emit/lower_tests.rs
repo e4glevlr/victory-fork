@@ -979,3 +979,13 @@ fn the_24_bit_multiplies_lower_both_halves() {
         lowers_valu(&[word]).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
     }
 }
+
+#[test]
+fn sums_of_absolute_differences_lower() {
+    // VOP3 `op v0, v1, v2, v3`: v_sad_u8, v_sad_hi_u8, v_sad_u16,
+    // v_sad_u32 and v_msad_u8.
+    for op in [0x15Au32, 0x15B, 0x15C, 0x15D, 0x171] {
+        let words = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
+        lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
+    }
+}
