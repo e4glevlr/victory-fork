@@ -3998,18 +3998,42 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 × 32-bit product, computed in 32-bit DXIL (no `INT64`).
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
-        let i64t = self.s.m.int(64);
-        let ext = if signed { Cast::SExt } else { Cast::ZExt };
-        let a = self.s.m.cast(c, ext, a, i64t);
-        let b = self.s.m.cast(c, ext, b, i64t);
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
-        let k32 = self.s.m.int_const(i64t, 32);
-        let hi = self.s.m.bin(c, Bin::LShr, m, k32);
-        self.s.flags |= flags::INT64;
-        self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (mask16, k16) = (k(self, 0xFFFF), k(self, 16));
+        let a0 = self.s.m.bin(c, Bin::And, a, mask16);
+        let a1 = self.s.m.bin(c, Bin::LShr, a, k16);
+        let b0 = self.s.m.bin(c, Bin::And, b, mask16);
+        let b1 = self.s.m.bin(c, Bin::LShr, b, k16);
+
+        let p00 = self.s.m.bin(c, Bin::Mul, a0, b0);
+        let p01 = self.s.m.bin(c, Bin::Mul, a0, b1);
+        let p10 = self.s.m.bin(c, Bin::Mul, a1, b0);
+        let p11 = self.s.m.bin(c, Bin::Mul, a1, b1);
+
+        // Hacker's Delight 8-2: every intermediate stays <= 0xFFFF_0000 (no u32 overflow).
+        let p00_hi = self.s.m.bin(c, Bin::LShr, p00, k16);
+        let t = self.s.m.bin(c, Bin::Add, p10, p00_hi);
+        let w1 = self.s.m.bin(c, Bin::And, t, mask16);
+        let w2 = self.s.m.bin(c, Bin::LShr, t, k16);
+        let u = self.s.m.bin(c, Bin::Add, p01, w1);
+        let u_hi = self.s.m.bin(c, Bin::LShr, u, k16);
+
+        let hi = self.s.m.bin(c, Bin::Add, p11, w2);
+        let hi = self.s.m.bin(c, Bin::Add, hi, u_hi);
+        if !signed {
+            return hi;
+        }
+        // Signed high word = unsigned high word - ((a < 0) ? b : 0) - ((b < 0) ? a : 0).
+        let k31 = k(self, 31);
+        let a_sign = self.s.m.bin(c, Bin::AShr, a, k31);
+        let b_sign = self.s.m.bin(c, Bin::AShr, b, k31);
+        let corr_a = self.s.m.bin(c, Bin::And, a_sign, b);
+        let corr_b = self.s.m.bin(c, Bin::And, b_sign, a);
+        let hi = self.s.m.bin(c, Bin::Sub, hi, corr_a);
+        self.s.m.bin(c, Bin::Sub, hi, corr_b)
     }
 
     /// `0 × anything = 0`, as in D3D9.

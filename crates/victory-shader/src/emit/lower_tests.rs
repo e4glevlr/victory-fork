@@ -265,6 +265,44 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+#[test]
+fn mul_hi_needs_no_int64() {
+    let sfi0 = |words: &[u32]| -> u64 {
+        let constants = RootParam {
+            sgprs: 4,
+            ..root(RootType::Constants, 0, 0)
+        };
+        let emitted = lower_with(words, vec![constants], vec![]).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        u64::from_le_bytes(features.data.try_into().unwrap())
+    };
+    for (name, op) in [("s_mul_hi_u32", 0x35u32), ("s_mul_hi_i32", 0x36)] {
+        let words = [
+            0x8000_0000 | (op << 23) | (4 << 16) | (1 << 8), // s4 = op(s0, s1)
+            0x7E00_0280,                                     // v_mov_b32 v0, 0
+            0x7E02_0204,                                     // v_mov_b32 v1, s4
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        assert_eq!(sfi0(&words) & 0x8000, 0, "{name} must not require INT64");
+    }
+    for (name, op) in [("v_mul_hi_u32", 0x16Au32), ("v_mul_hi_i32", 0x16C)] {
+        let words = [
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0x7E04_0201, // v_mov_b32 v2, s1
+            0xD400_0003 | (op << 16),
+            257 | (258 << 9), // v_<op> v3, v1, v2
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        assert_eq!(sfi0(&words) & 0x8000, 0, "{name} must not require INT64");
+    }
+}
+
 fn perm_features(selector: u32) -> u64 {
     // Synthetic compute shader:
     // v0 is the thread ID and can supply a dynamic selector.
