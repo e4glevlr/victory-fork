@@ -45,8 +45,9 @@ or pass -Build.
 param(
     # A name for the run folder and the summary.
     [string]$Label = 'run',
-    # Switches for this run, e.g. @{ VICTORY_RELAY = '0' }.
-    [hashtable]$Switches = @{},
+    # Switches for this run: @{ VICTORY_RELAY = '0' }, or 'VICTORY_RELAY=0'
+    # (several as a list), which also passes through `powershell -File`.
+    [object]$Switches = @{},
     # Seconds measured, after -Warmup, from the world's first frame.
     [int]$Seconds = 180,
     # Seconds of world frames left out first (pipelines still being made).
@@ -77,6 +78,15 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $victory = Join-Path $root 'target\diag\victory.exe'
 $invariant = [Globalization.CultureInfo]::InvariantCulture
+if ($Switches -isnot [hashtable]) {
+    $table = @{}
+    foreach ($pair in @($Switches) | ForEach-Object { "$_" -split '[,;]' } | Where-Object { $_ }) {
+        $name, $value = $pair -split '=', 2
+        if ($null -eq $value) { throw "a switch is NAME=VALUE, not '$pair'" }
+        $table[$name.Trim()] = $value.Trim()
+    }
+    $Switches = $table
+}
 
 # The summary's columns: the frame line's fields, per frame.
 $metrics = @(
