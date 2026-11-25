@@ -45,7 +45,12 @@ impl Lower<'_> {
     /// block, for both dwords.
     /// shortcut: the host adds a wave's terms in its own order, not the console's tree of
     /// lanes; the sum can differ in its last bits where terms round (as for 32-bit sums).
+    /// `VICTORY_EXACT_F64_SUMS=1` refuses such a sum instead (to count the programs it takes).
     pub(super) fn sum64(&mut self, lo: Value, hi: Value, mask: Value) -> Result<[V; 2], Why> {
+        static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EXACT.get_or_init(|| std::env::var_os("VICTORY_EXACT_F64_SUMS").is_some_and(|v| v == "1")) {
+            return Err("a 64-bit wave sum in the host's order (VICTORY_EXACT_F64_SUMS)");
+        }
         let key = (lo, hi, mask, self.cur);
         if let Some(&d) = self.sums64.get(&key) {
             return Ok(d);
