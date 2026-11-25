@@ -805,6 +805,63 @@ fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own()
     }
 }
 
+/// The census of a gather at a level of red at (v0, v0) and level v0
+/// through the immediate sampler whose word 0 is `w0` (word 0's low 16
+/// bits; then levels 0-12, linear filters, a transparent black border).
+fn gather_at_level_census(w0: u16) -> [u32; crate::emit::census::KINDS.len()] {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000,                 // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xB008_0000 | u32::from(w0), // s_movk_i32 s8, w0
+        0xBE89_03FF,
+        0x00C0_0000, // s_mov_b32 s9, 0xc00000
+        0xBE8A_03FF,
+        0x1850_0000, // s_mov_b32 s10, 0x18500000
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0x7E02_0D00, // v_cvt_f32_u32 v1, v0
+        0x7E04_0301, // v_mov_b32 v2, v1
+        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF110_0108,
+        0x0043_0401, // image_gather4_l v[4:7], v[1:3], s[12:19], s[8:11] dmask:0x1 dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x0608_0B04, // v_add_f32 v4, v4, v5
+        0x060C_0F06, // v_add_f32 v6, v6, v7
+        0x0608_0D04, // v_add_f32 v4, v4, v6
+        0xD834_0000,
+        0x0000_0400, // ds_write_b32 v0, v4
+        S_ENDPGM,
+    ];
+    let (layout, used) = texture_tables();
+    crate::emit::census::TEST_CENSUS.set(true);
+    let l = lower_wave(&words, layout, used, false).unwrap();
+    crate::emit::census::take(&l.dxil).expect("counted").counts
+}
+
+#[test]
+fn gathers_at_a_level_read_a_black_border_outside() {
+    let kind = |name| {
+        crate::emit::census::KINDS
+            .iter()
+            .position(|k| *k == name)
+            .unwrap()
+    };
+    // Clamped to a border in x, y and z (as the title's culling sampler),
+    // or to the last texel.
+    let (border, edge) = (gather_at_level_census(0x1B6), gather_at_level_census(0x92));
+    // Four loads at the level either way, each texel bounded in x and y (a
+    // maximum and a minimum) before its conversion to an integer.
+    let reads = |c: &[u32]| (c[kind("texture_read")], c[kind("math_call")]);
+    assert_eq!(reads(&border).0, 4);
+    assert_eq!(reads(&border), reads(&edge));
+    // Only the edge sampler's upper bound is the last texel (size - 1, one
+    // subtraction per axis); the border's is one past it, the size, which
+    // the host loads as 0, the border's colour.
+    assert_eq!(edge[kind("arith")], border[kind("arith")] + 2);
+}
+
 #[test]
 fn cube_samples_with_gradients_take_the_log2_level_and_its_clamp() {
     // `sample`: image_sample_d(_cl) v[12:15], v[1:8], s[8:15], s[16:19]

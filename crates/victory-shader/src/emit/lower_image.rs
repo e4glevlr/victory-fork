@@ -645,9 +645,16 @@ impl Lower<'_> {
                         // two texels beside the first one's place, so a
                         // meshlet three or four texels wide was tested
                         // against a quarter of what it covers.
-                        // shortcut: the level is rounded to a whole one and
-                        // coordinates past the edge are clamped, whatever
-                        // the sampler says.
+                        // Through an immediate sampler that clamps x and y
+                        // to a transparent black border (the title's culling
+                        // one) a texel outside reads 0, as a load outside a
+                        // view does: texels are kept at most one outside.
+                        // shortcut: the level is rounded to a whole one, other
+                        // samplers read the edge texel outside, and a NaN
+                        // coordinate reads as -inf (the hardware's: 0); port
+                        // upstream's gather_first if another sampler shows up.
+                        let border = matches!(ss, Source::Constant(w)
+                            if w.len() >= 4 && w[0] & 0x3F == 0x36 && w[3] >> 30 == 0);
                         let lod = addr_packed(self, coord_base, coords)?;
                         let lod = to_float(self, lod);
                         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
@@ -665,7 +672,11 @@ impl Lower<'_> {
                         for k in 0..2 {
                             let n = self.s.m.extract(c, d, k as u32);
                             let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
-                            let last = self.s.m.bin(c, Bin::Sub, n, one);
+                            let (least, last) = if border {
+                                (self.s.m.f32((-1.0f32).to_bits()), n)
+                            } else {
+                                (zero, self.s.m.bin(c, Bin::Sub, n, one))
+                            };
                             let t = self.s.m.bin(c, Bin::Mul, cs[k], n);
                             let t = self.s.m.bin(c, Bin::Sub, t, half);
                             let first = self.unary(27, t); // round down
@@ -674,7 +685,7 @@ impl Lower<'_> {
                             let first = self.s.m.bin(c, Bin::Add, first, by);
                             let next = self.s.m.bin(c, Bin::Add, first, one);
                             for (slot, x) in [(&mut lo[k], first), (&mut hi[k], next)] {
-                                let x = self.binary(35, x, zero); // maximum
+                                let x = self.binary(35, x, least); // maximum
                                 let x = self.binary(36, x, last); // minimum
                                 *slot = self.s.m.cast(c, Cast::FpToSi, x, i32t);
                             }
