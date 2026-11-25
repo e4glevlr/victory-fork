@@ -1613,3 +1613,38 @@ fn a_first_lane_read_of_a_sum_of_lds_at_one_address_lowers_on_32_lane_hosts() {
     };
     assert!(e.to_string().contains("a first-lane read where not every lane runs"), "{e}");
 }
+
+/// Lowers `alu` on the thread id v0 into v3, kept by an LDS store.
+fn refactoring(alu: &[u32]) -> (bool, Vec<String>) {
+    let mut words = alu.to_vec();
+    words.extend([
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD834_0000, // ds_write_b32 v4, v3
+        0x0000_0304,
+        S_ENDPGM,
+    ]);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let names = ir::build(&code, false, 256).unwrap().blocks[0]
+        .insts
+        .iter()
+        .map(|i| i.name().to_string())
+        .collect();
+    let lowered = lower_with(&words, vec![], vec![]).unwrap();
+    (lowered.refactoring, names)
+}
+
+#[test]
+fn only_programs_with_fmad_let_the_host_refactor() {
+    let (fused, names) = refactoring(&[
+        0xD54B_0003, // v_fma_f32 v3, v0, v0, v0
+        0x0402_0100,
+    ]);
+    assert_eq!(names[0], "v_fma_f32");
+    assert!(fused, "FMad needs refactoring to fuse");
+    let (apart, names) = refactoring(&[
+        0x1006_0100, // v_mul_f32 v3, v0, v0
+        0x0606_0103, // v_add_f32 v3, v3, v0
+    ]);
+    assert_eq!(names[..2], ["v_mul_f32", "v_add_f32"]);
+    assert!(!apart, "a multiply and an add stay apart");
+}
