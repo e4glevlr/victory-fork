@@ -47,10 +47,7 @@ impl Lower<'_> {
     /// lanes; the sum can differ in its last bits where terms round (as for 32-bit sums).
     /// `VICTORY_EXACT_F64_SUMS=1` refuses such a sum instead (to count the programs it takes).
     pub(super) fn sum64(&mut self, lo: Value, hi: Value, mask: Value) -> Result<[V; 2], Why> {
-        static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *EXACT.get_or_init(|| std::env::var_os("VICTORY_EXACT_F64_SUMS").is_some_and(|v| v == "1")) {
-            return Err("a 64-bit wave sum in the host's order (VICTORY_EXACT_F64_SUMS)");
-        }
+        exact_f64_sums()?;
         let key = (lo, hi, mask, self.cur);
         if let Some(&d) = self.sums64.get(&key) {
             return Ok(d);
@@ -90,6 +87,7 @@ impl Lower<'_> {
     /// [`Self::sum64`] in the paired form: the lower lanes' sum, then the upper lanes' added,
     /// as two host waves add theirs; dword `high` of it, for both lanes of this thread.
     pub(super) fn paired_sum64(&mut self, high: bool, lo: Value, hi: Value, mask: Value) -> Result<[V; 2], Why> {
+        exact_f64_sums()?;
         let key = (lo, hi, mask, self.cur);
         let d = match self.sums64.get(&key) {
             Some(&d) => d,
@@ -322,4 +320,14 @@ impl Lower<'_> {
         self.write(inst, Reg::V(reg + 1), hi, guard);
         Ok(())
     }
+}
+
+/// `VICTORY_EXACT_F64_SUMS=1`: a 64-bit wave sum in the host's order ([`Lower::sum64`], and in
+/// the paired form) is refused, to count the programs that take it.
+fn exact_f64_sums() -> Result<(), Why> {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EXACT.get_or_init(|| std::env::var_os("VICTORY_EXACT_F64_SUMS").is_some_and(|v| v == "1")) {
+        return Err("a 64-bit wave sum in the host's order (VICTORY_EXACT_F64_SUMS)");
+    }
+    Ok(())
 }
