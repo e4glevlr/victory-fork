@@ -615,6 +615,9 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // PIX sees only devices made after its capturer is loaded.
+    #[cfg(feature = "diagnostics")]
+    crate::pix::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -7292,6 +7295,8 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
+            #[cfg(feature = "diagnostics")]
+            crate::pix::at_present(frame);
             #[cfg(feature = "diagnostics")]
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]

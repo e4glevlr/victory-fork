@@ -40,6 +40,8 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod pix;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

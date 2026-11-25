@@ -58,6 +58,10 @@ param(
     [switch]$SkipCutscenes,
     # Seconds between captured frames (0: none).
     [int]$CaptureEvery = 20,
+    # Take a PIX GPU capture of one frame this many seconds after the
+    # world's first frame (needs PIX installed; the capturer slows every
+    # frame, so the run's frame times are not comparable with others).
+    [int]$PixAt = -1,
     # The data folder runs start from (default: the configured data_dir).
     [string]$Seed,
     # The run folder (default: <cache_dir>\bench\<time>-<label>).
@@ -149,6 +153,7 @@ function Write-Summary([string]$dir, [hashtable]$facts) {
     $untranslated = @{}
     $refused = @{}
     $notes = New-Object System.Collections.Generic.List[string]
+    $slow = New-Object System.Collections.Generic.List[double]
     $first = $null
     foreach ($line in [System.IO.File]::ReadLines($log)) {
         if (-not $first -and $line -match '^(\S+Z)\s') { $first = [datetime]::Parse($Matches[1], $invariant).ToUniversalTime() }
@@ -161,7 +166,9 @@ function Write-Summary([string]$dir, [hashtable]$facts) {
             $untranslated[$Matches[1]] = 1
         } elseif ($line -match 'host (mesh )?pipeline refused.*shaders=(\[.*?\])') {
             $refused[$Matches[2]] = 1
-        } elseif ($line -match 'device removed|DEVICE_REMOVED|DEVICE_HUNG|unhandled exception|slow driver compile') {
+        } elseif ($line -match 'slow driver compile.*seconds=([\d.]+)') {
+            $slow.Add([double]::Parse($Matches[1], $invariant))
+        } elseif ($line -match 'device removed|DEVICE_REMOVED|DEVICE_HUNG|unhandled exception|PIX capture|VICTORY_PIX|VICTORY_DEBUG_NULL_VIEWS') {
             if ($notes.Count -lt 40) { $notes.Add(($line -replace '^\S+\s+', '')) }
         }
     }
@@ -197,6 +204,9 @@ function Write-Summary([string]$dir, [hashtable]$facts) {
         untranslated    = $untranslated.Count
         refused         = $refused.Count
         crashes         = if (Test-Path $crashes) { @(Get-Content $crashes).Count } else { 0 }
+        slow_compiles   = $slow.Count
+        slow_compile_s  = [math]::Round(($slow | Measure-Object -Sum).Sum, 1)
+        slowest_compile_s = if ($slow.Count) { [math]::Round(($slow | Measure-Object -Maximum).Maximum, 1) } else { 0 }
         notes           = $notes
     }
     $summary | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $dir 'summary.json')
@@ -213,6 +223,7 @@ function Write-Summary([string]$dir, [hashtable]$facts) {
     $md.Add('- world after ' + $summary.world_after_s + ' s; window ' + $summary.window + ': ' + $window.Count + ' frame lines')
     $md.Add('- shaders not translated: ' + $untranslated.Count + '; host pipelines refused: ' + $refused.Count +
         '; crashes.log lines: ' + $summary.crashes + '; exit: ' + $facts.exit + '; peak private memory: ' + $facts.peak_private_gb + ' GB')
+    $md.Add('- driver compiles of 2 s or more: ' + $slow.Count + ', ' + $summary.slow_compile_s + ' s in all, the slowest ' + $summary.slowest_compile_s + ' s')
     $md.Add('')
     $md.Add('| | ' + $heads + ' |')
     $md.Add('|---|' + ('---|' * $metrics.Count))
@@ -407,11 +418,13 @@ function Get-Frame([double]$timeout = 5) {
 }
 
 $saved = @{}
+$pix = Join-Path $Out 'pix'
 $set = @{
     VICTORY_DATA_DIR  = $runData
     VICTORY_KEYS_FILE = $keys
     VICTORY_CAPTURE   = $frames
 }
+if ($PixAt -ge 0) { $set['VICTORY_PIX'] = $pix }
 foreach ($k in $Switches.Keys) { $set[$k] = [string]$Switches[$k] }
 foreach ($k in $set.Keys) {
     $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
@@ -458,6 +471,7 @@ try {
     $lastCapture = 0
     $lastLook = 0
     $lastScreen = ''
+    $pixAsked = $false
     while ($true) {
         Start-Sleep -Milliseconds 500
         Watch-Log
@@ -492,6 +506,14 @@ try {
             $lastCapture = $t
         }
         if ($SkipCutscenes -and $t - $lastPress -ge 8) { Send-Keys @('Enter'); $lastPress = $t }
+        if ($PixAt -ge 0 -and -not $pixAsked -and ((Get-Date) - $worldAt).TotalSeconds -ge $PixAt) {
+            New-Item -ItemType Directory -Force -Path $pix | Out-Null
+            Set-Content -Path (Join-Path $pix 'capture') -Value '1'
+            # The same frame as a PNG, to find the moment in the capture.
+            New-Item -ItemType File -Force -Path (Join-Path $frames 'now') | Out-Null
+            $pixAsked = $true
+            Write-Host ('PIX capture asked for at {0:0} s in the world (into {1})' -f ((Get-Date) - $worldAt).TotalSeconds, $pix)
+        }
         # A frame line lands every 5 s: run one past the window's end.
         if (((Get-Date) - $worldAt).TotalSeconds -ge $Warmup + $Seconds + 6) { break }
     }

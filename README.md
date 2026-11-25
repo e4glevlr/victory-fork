@@ -216,8 +216,11 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`); a file named `now` put in the folder saves the next frame |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer (needs Windows' Graphics Tools: `Add-WindowsCapability -Online -Name Tools.Graphics.DirectX~~~~0.0.1.0`) |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_PIX=<dir>` | loads the installed PIX's GPU capturer; a file named `capture` put in the folder (holding a frame count, 1 if empty) saves the next frames as `frame-<n>.wpix` there, to open in PIX (every draw's DXIL, views, targets, pixel history) |
+| `VICTORY_DEBUG_NULL_VIEWS=1` | 2D texture slots that would read zeros read a checkerboard: magenta where the title made a view the host has no texture for, cyan where there is no view at all; black that is left is the title's own |
+| `VICTORY_SHADER_OPT=<bits>` | clean-up passes over translated shaders (1 dead code, 2 constants, 4 reuse, 8 branch facts, 16 loads, 32 wave64 first lane; `0` none); `VICTORY_SHADER_OPT_STAGES=ps,ms` limits them to those stages (own shader cache entries) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
