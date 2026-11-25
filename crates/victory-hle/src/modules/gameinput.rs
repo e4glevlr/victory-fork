@@ -650,13 +650,61 @@ pub(crate) mod cursor {
     pub(crate) static CAPTURED: AtomicBool = AtomicBool::new(false);
     /// The title window has focus (kept by the host poll).
     pub(crate) static FOCUSED: AtomicBool = AtomicBool::new(false);
+    /// The user is sizing or moving the window (between `WM_ENTERSIZEMOVE`
+    /// and `WM_EXITSIZEMOVE`): the cursor is theirs.
+    static SIZING: AtomicBool = AtomicBool::new(false);
+    /// How far inside the client area a captured cursor is held, so it
+    /// cannot reach the window's borders and start a size loop.
+    const INSET: i32 = 16;
+
+    pub(crate) fn sizing() -> bool {
+        SIZING.load(Ordering::Relaxed)
+    }
+
+    /// The window entered (`true`) or left a size or move loop. A captured
+    /// cursor is freed first: clipped to a client area that shrinks under
+    /// it, it would drag the window down to its title bar. Afterwards a
+    /// click in the window captures it again.
+    pub(crate) fn size_move(entered: bool) {
+        if entered {
+            release();
+        }
+        SIZING.store(entered, Ordering::Relaxed);
+    }
+
+    /// Whether the window gaining focus captures the cursor: not when the
+    /// focus came from a mouse click (a click in the client area captures by
+    /// itself; one on a border or the title bar starts a size or move loop
+    /// and must not), and not during such a loop.
+    pub(crate) fn captures_on_focus(was_focused: bool, focused: bool, button_down: bool) -> bool {
+        focused && !was_focused && !button_down && !sizing()
+    }
+
+    /// Whether the cursor is held in the window now.
+    pub(crate) fn clips(focused: bool) -> bool {
+        focused && captured() && !sizing()
+    }
+
+    /// Where a captured cursor is held: the client rectangle (left, top,
+    /// right, bottom) shrunk by [`INSET`]; `None` for one too small for that.
+    pub(crate) fn clip_rect(client: (i32, i32, i32, i32)) -> Option<(i32, i32, i32, i32)> {
+        let (l, t, r, b) = client;
+        let rect = (l + INSET, t + INSET, r - INSET, b - INSET);
+        (rect.2 > rect.0 && rect.3 > rect.1).then_some(rect)
+    }
 
     pub(crate) fn captured() -> bool {
         CAPTURED.load(Ordering::Relaxed)
     }
 
+    /// Whether a capture may happen now: when capture is wanted at all
+    /// (`enabled`) and the window is not being sized or moved.
+    pub(crate) fn may_capture(enabled: bool) -> bool {
+        enabled && !sizing()
+    }
+
     pub(crate) fn capture() {
-        if ENABLED.load(Ordering::Relaxed) && !CAPTURED.swap(true, Ordering::Relaxed) {
+        if may_capture(ENABLED.load(Ordering::Relaxed)) && !CAPTURED.swap(true, Ordering::Relaxed) {
             tracing::info!("mouse cursor captured");
         }
     }
@@ -1350,10 +1398,16 @@ mod host {
             if !focus {
                 cursor::release();
             } else if !self.was_focused {
-                cursor::capture();
+                // SAFETY: plain queries.
+                let button_down = MOUSE_BUTTONS
+                    .into_iter()
+                    .any(|vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0);
+                if cursor::captures_on_focus(self.was_focused, focus, button_down) {
+                    cursor::capture();
+                }
             }
             self.was_focused = focus;
-            if focus && cursor::captured() {
+            if cursor::clips(focus) {
                 // SAFETY: plain queries on the foreground window, ours.
                 unsafe {
                     let hwnd = GetForegroundWindow();
@@ -1372,15 +1426,20 @@ mod host {
                     ClientToScreen(hwnd, &mut corners[0]);
                     ClientToScreen(hwnd, &mut corners[1]);
                     let [a, b] = corners;
-                    if b.x > a.x && b.y > a.y {
+                    if let Some((left, top, right, bottom)) =
+                        cursor::clip_rect((a.x, a.y, b.x, b.y))
+                    {
                         let rect = RECT {
-                            left: a.x,
-                            top: a.y,
-                            right: b.x,
-                            bottom: b.y,
+                            left,
+                            top,
+                            right,
+                            bottom,
                         };
                         ClipCursor(&rect);
                         self.clipped = true;
+                    } else if self.clipped {
+                        ClipCursor(std::ptr::null());
+                        self.clipped = false;
                     }
                 }
             } else if self.clipped {
@@ -2102,6 +2161,36 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(r).left_y, 0.0, "by letter, Z is not bound");
         release(r);
+    }
+
+    /// The cursor's rules around a size or move loop (PR feedback: dragging
+    /// a border with a captured cursor collapsed the window, the clip
+    /// following the shrinking client area).
+    #[test]
+    fn a_size_or_move_loop_frees_the_cursor_and_border_clicks_do_not_capture() {
+        // Focus from Alt-Tab captures; focus from a click does not (the
+        // click captures if it lands in the client area).
+        assert!(cursor::captures_on_focus(false, true, false));
+        assert!(!cursor::captures_on_focus(false, true, true));
+        assert!(!cursor::captures_on_focus(true, true, false));
+        assert!(!cursor::captures_on_focus(false, false, false));
+        // The clip stays inside the client area, away from the borders.
+        assert_eq!(cursor::clip_rect((100, 50, 900, 650)), Some((116, 66, 884, 634)));
+        assert_eq!(cursor::clip_rect((0, 0, 1339, 30)), None, "a strip: no clip");
+        // A size loop frees a captured cursor, holds off captures and
+        // clipping, and leaves the cursor free when it ends. (The capture
+        // flag is set directly: other tests' hubs set whether capture is
+        // wanted at all.)
+        cursor::CAPTURED.store(true, Ordering::Relaxed);
+        assert!(cursor::clips(true) && cursor::may_capture(true));
+        cursor::size_move(true);
+        assert!(!cursor::captured() && !cursor::clips(true));
+        assert!(!cursor::may_capture(true), "no capture during the loop");
+        assert!(!cursor::captures_on_focus(false, true, false));
+        cursor::size_move(false);
+        assert!(!cursor::captured(), "still free after the loop");
+        assert!(cursor::may_capture(true), "a click in the window captures again");
+        assert!(!cursor::may_capture(false));
     }
 
     #[test]
