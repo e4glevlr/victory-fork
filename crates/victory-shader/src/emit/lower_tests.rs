@@ -1525,3 +1525,91 @@ fn a_complemented_ballot_counts_where_not_every_lane_runs() {
         assert!(l.wave_ops);
     }
 }
+
+/// The ray-tracing builder's scan (`XboxBvhBuilder.dll`, a wave64 program of 512 threads),
+/// lowered for a host of 32-lane waves: lanes with a count in v12 walk LDS dword by dword,
+/// adding each to a running sum in v13 that `v_readfirstlane` carries in s17 to the next
+/// round, until their count is reached. The LDS read takes its address from v13 (made from
+/// the round in s16, the same in every lane) or, with `addr` 0, from v0 (the thread's own).
+fn lowered_scan(addr: u32) -> Result<Lowered, crate::ShaderError> {
+    let words = [
+        0xD760_0004,
+        0x0001_0100, // v_readlane_b32 s4, v0, 0 (a lane read: the halves exchange)
+        0x3618_0083, // v_and_b32 v12, 3, v0
+        0x7E1A_0280, // v_mov_b32 v13, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DAA_1880, // v_cmpx_ne_u32 exec, 0, v12
+        0xBF88_0013, // s_cbranch_execz (the restore of EXEC)
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBF82_0002, // s_branch (the round)
+        0x87FE_0610, // s_and_b64 exec, s[16:17], s[6:7]
+        0x7E22_050D, // v_readfirstlane_b32 s17, v13
+        0x8F10_8212, // s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E1A_0210, // v_mov_b32 v13, s16
+        0xD8D8_0000,
+        0x0D00_0000 | addr, // ds_read_b32 v13, v{addr}
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A1A_1A11, // v_add_nc_u32 v13, s17, v13
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7DA4_1812, // v_cmpx_eq_u32 exec, s18, v12
+        0xBF80_0000, // s_nop 0
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF2, // s_cbranch_scc1 (the next round)
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E1C_0204, // v_mov_b32 v14, s4
+        0xD834_0000,
+        0x0000_0D00, // ds_write_b32 v0, v13
+        0xD834_0000,
+        0x0000_0E00, // ds_write_b32 v0, v14
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let was = super::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        view_marks: false,
+    });
+    super::TEST_HOST_WAVE.set(was);
+    lowered
+}
+
+#[test]
+fn a_first_lane_read_of_a_sum_of_lds_at_one_address_lowers_on_32_lane_hosts() {
+    // The sum is the same in every lane that runs, so the host wave's own first lane holds
+    // the console's: no exchange with the other half, which may have no lane left.
+    if let Err(e) = lowered_scan(13) {
+        panic!("the scan of one LDS address must lower on a 32-lane host: {e}");
+    }
+    // Read from each thread's own address, the lanes' sums differ: still refused.
+    let Err(e) = lowered_scan(0) else {
+        panic!("a scan of per-lane LDS addresses was lowered");
+    };
+    assert!(e.to_string().contains("a first-lane read where not every lane runs"), "{e}");
+}
