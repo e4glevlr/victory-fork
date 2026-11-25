@@ -523,7 +523,9 @@ impl Lower<'_> {
                     // unit wide). The level they select is taken from the
                     // longer of the two, in texels, and sampled directly.
                     // shortcut: no anisotropic filtering for these samples
-                    // (the longer axis alone decides the level).
+                    // (the longer axis alone decides the level), and a
+                    // sampler's LOD bias comes after the `_cl` clamp (the
+                    // console adds it before).
                     let mut len = [fu; 2];
                     for (axis, slot) in len.iter_mut().enumerate() {
                         let mut sum = self.s.m.f32(0);
@@ -545,11 +547,13 @@ impl Lower<'_> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // Log is base 2; a length of 0 gives minus infinity,
+                    // which the sampler clamps to level 0. Then FMax with
+                    // the clamp.
+                    let mut lod = self.unary(23, texels);
+                    if has_cl {
+                        lod = self.binary(35, lod, clamp);
+                    }
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

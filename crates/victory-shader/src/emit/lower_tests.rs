@@ -658,6 +658,58 @@ fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own()
 }
 
 #[test]
+fn cube_samples_with_gradients_take_the_log2_level_and_its_clamp() {
+    // `sample`: image_sample_d(_cl) v[12:15], v[1:8], s[8:15], s[16:19]
+    // dmask:0xf dim:CUBE, its result stored to LDS. Face gradients
+    // (0.5, 0) and (0, 1), face coordinates 0.5, 0.5 on face 0, clamp 2.
+    let level = |sample: u32| {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0
+            0x7E02_02F0, // v_mov_b32 v1, 0.5
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_02F2, // v_mov_b32 v4, 1.0
+            0x7E0A_02F0, // v_mov_b32 v5, 0.5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7E10_02F4, // v_mov_b32 v8, 2.0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            sample,
+            0x0082_0C01,
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap();
+        let calls = super::super::shader::WRITTEN.with(|w| {
+            w.borrow()
+                .as_ref()
+                .unwrap()
+                .call_args("dx.op.sampleLevel.f32")
+        });
+        assert_eq!(calls.len(), 1);
+        calls[0][10].clone()
+    };
+    // Log (23) is base 2 already: the level is log2 of the longer
+    // gradient in texels, with nothing after it.
+    let plain = level(0xF088_0F18);
+    assert!(plain.starts_with("unary(23, "), "{plain}");
+    // `_cl`: FMax (35) with the clamp after the address of the face.
+    let clamped = level(0xF08C_0F18);
+    assert!(clamped.starts_with("binary(35, unary(23, "), "{clamped}");
+    assert!(clamped.ends_with(", 2)"), "{clamped}");
+}
+
+#[test]
 fn scalar_bit_tests_lower() {
     // Each tests one bit of a constant into SCC and branches on it (only
     // code with an effect needs its operands).

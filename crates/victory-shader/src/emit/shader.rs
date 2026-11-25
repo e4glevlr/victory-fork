@@ -42,6 +42,13 @@ pub const SLOT_VIEWS_COUNT: u32 = SLOT_STRIDES_COUNT;
 /// shader indexes it by shifting.
 pub const SLOT_VIEWS_RECORD_BYTES: u32 = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// The module this thread's last [`Shader::finish`] wrote, for tests to read.
+    pub(crate) static WRITTEN: std::cell::RefCell<Option<Module>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -831,6 +838,8 @@ impl Shader {
         self.m.single_latches();
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
+        #[cfg(test)]
+        WRITTEN.with(|w| *w.borrow_mut() = Some(std::mem::take(&mut self.m)));
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());

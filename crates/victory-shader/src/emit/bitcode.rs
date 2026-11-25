@@ -1127,6 +1127,57 @@ impl Writer {
 }
 
 #[cfg(test)]
+impl Module {
+    /// The arguments of each call to `name` in `main`, written out as
+    /// expressions (a test's view of the code).
+    pub(crate) fn call_args(&self, name: &str) -> Vec<Vec<String>> {
+        let Some(&f) = self.func_ids.get(name) else {
+            return vec![];
+        };
+        let body = self.blocks.iter().flat_map(|b| &b.body);
+        body.filter_map(|&i| match &self.insts[i as usize].op {
+            Op::Call(g, args) if *g == f => Some(args.iter().map(|&a| self.expr(a)).collect()),
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// `v` as `unary(23, Mul(x, 0.5))` and the like: a call by its name
+    /// without `dx.op.` and the overload, other operations by their kind.
+    fn expr(&self, v: V) -> String {
+        let list = |vs: &[V]| {
+            vs.iter()
+                .map(|&x| self.expr(x))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match v {
+            V::Const(i) => match &self.consts[i as usize].1 {
+                Const::Int(x) => x.to_string(),
+                Const::Float(bits) => f32::from_bits(*bits).to_string(),
+                Const::Aggregate(ids) => {
+                    let ids: Vec<V> = ids.iter().map(|&k| V::Const(k)).collect();
+                    format!("[{}]", list(&ids))
+                }
+                Const::Undef => "undef".into(),
+            },
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Call(f, args) => {
+                    let name = &self.funcs[*f as usize].name;
+                    let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                    format!("{}({})", name.split('.').next().unwrap_or(name), list(args))
+                }
+                Op::Bin(op, a, b) => format!("{op:?}({})", list(&[*a, *b])),
+                Op::Cast(op, a) => format!("{op:?}({})", self.expr(*a)),
+                Op::Extract(a, k) => format!("extract({}, {k})", self.expr(*a)),
+                op => format!("{op:?}"),
+            },
+            v => format!("{v:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
