@@ -7405,6 +7405,21 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let [n, total, longest] =
+                    [0, 1, 2].map(|i| crate::watch::REMAPS[i].swap(0, Relaxed));
+                if n > 0 {
+                    tracing::info!(
+                        "the title's mapping changes: {:.1} a frame, the lock held {:.1} ms a frame in all, \
+                         the longest change {:.1} ms",
+                        n as f64 / frames,
+                        total as f64 / 1e3 / frames,
+                        longest as f64 / 1e3
+                    );
+                }
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(

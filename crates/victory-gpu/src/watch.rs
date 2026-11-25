@@ -1033,14 +1033,46 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    #[cfg(feature = "diagnostics")]
+    std::time::Instant,
+);
+
+/// Since they were last taken: how many times the runtime changed a mapping,
+/// the microseconds it held the lock for all of them, and the longest one.
+///
+/// Every reader's wait in the texture lane is a wait for this, and nothing
+/// measured it: the frame line counts the readers, so a count of the writer
+/// says whether their sum is one long change or many short ones.
+#[cfg(feature = "diagnostics")]
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = self.1.elapsed().as_micros() as u64;
+        REMAPS[0].fetch_add(1, Relaxed);
+        REMAPS[1].fetch_add(us, Relaxed);
+        REMAPS[2].fetch_max(us, Relaxed);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    Remapping(
+        guard,
+        #[cfg(feature = "diagnostics")]
+        started,
+    )
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
