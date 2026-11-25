@@ -1104,7 +1104,8 @@ impl HostHeap {
             .flatten();
         let views = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT) * 16;
+                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT)
+                    * u64::from(victory_shader::emit::SLOT_VIEWS_RECORD_BYTES);
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {

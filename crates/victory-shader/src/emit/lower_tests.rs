@@ -7,6 +7,28 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
+fn view_records_are_indexed_by_their_sixteen_byte_size() {
+    // The host writes four dwords per slot (address lo/hi, length,
+    // stride); the shader must step 16 bytes, not 8.
+    assert_eq!(super::super::shader::SLOT_VIEWS_RECORD_BYTES, 16);
+    assert_eq!(1u32 << super::view_record_shift(), 16);
+    assert_eq!(5u32 << super::view_record_shift(), 80);
+}
+
+#[test]
+fn view_address_indexed_keeps_the_loaded_address() {
+    // The table offset is part of the slot, not of the buffer address:
+    // the function must not add `a.offset` to what the table holds.
+    let src = include_str!("lower.rs");
+    let body = src
+        .split("fn view_address_indexed")
+        .nth(1)
+        .and_then(|s| s.split("fn address_plus").next())
+        .unwrap();
+    assert!(!body.contains("address_plus("));
+}
+
+#[test]
 fn packed_pixel_inputs_find_their_second_row() {
     use super::super::container::SigElement;
     use super::half_input_partners;
