@@ -6848,12 +6848,13 @@ impl<'a> Lower<'a> {
         let b = self.handle(site, &Source::Constant(second.clone()), true, props)?;
         let p = self.x.p;
         let mut incoming = Vec::new();
-        for (&q, w) in p.blocks[*block].preds.iter().zip(&words) {
+        for (n, (&q, w)) in p.blocks[*block].preds.iter().zip(&words).enumerate() {
             if self.block[q].is_none() {
                 continue;
             }
             let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
-            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            let again = p.blocks[*block].preds[..n].contains(&q);
+            let at = self.edges.get(&(q, *block, again)).copied().unwrap_or(tail);
             incoming.push((self.s.m.bool(*w == second), at));
         }
         let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;

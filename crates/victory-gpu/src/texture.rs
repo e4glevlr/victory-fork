@@ -863,7 +863,7 @@ impl Staging {
             unseen = unwritten && behind_on;
         }
         let hash_before = last.hash;
-        let read = self.refresh_hashed(last, size);
+        let read = self.refresh_hashed(last, size, wait_flight);
         // changed with no write the guard saw: hashed at every check now
         if unseen && hash_before.is_some() && last.hash != hash_before && !last.behind_guard {
             last.behind_guard = true;
@@ -878,7 +878,7 @@ impl Staging {
 
     /// [`Staging::refresh_timed`] past the write watch and the guards: the
     /// texture's memory read, hashed and detiled if it changed.
-    fn refresh_hashed(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_hashed(&self, last: &mut Last, size: usize, wait_flight: &mut dyn FnMut(u64)) -> usize {
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
