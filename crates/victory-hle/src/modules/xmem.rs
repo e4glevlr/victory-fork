@@ -289,6 +289,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    if layout.size() >= WATCHED_FROM && watched_blocks() {
+        return alloc_watched(layout);
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -309,6 +312,54 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// Blocks of [`XMemAllocDefault`] from this size on are reservations of
+/// their own with write watching, not host heap memory.
+///
+/// Resources the title makes through the device (committed ones, and
+/// placed ones in heaps it makes there) get their memory here. The GPU side
+/// copies the parts of title buffers a submission reads before it runs:
+/// for write-watched memory only the 64 KiB pages written since the last
+/// copy, for host heap memory, which cannot be watched, all of it, at every
+/// submission that reads it. Measured with the bench title (24 submissions
+/// a frame reading a 64 MB static buffer and 8 MB the CPU writes): 72
+/// refreshes of 1,627 MB and 380 ms of copying a frame from the host heap.
+const WATCHED_FROM: usize = 64 << 10;
+
+/// The second header word's flag for a [`WATCHED_FROM`] block: the rest is
+/// the user address' offset from the reservation.
+const WATCHED: usize = 1 << (usize::BITS - 1);
+
+/// On by default; `VICTORY_XMEM_WATCH=0` takes every block from the host
+/// heap, as before.
+fn watched_blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_WATCH").is_none_or(|v| v != "0"))
+}
+
+/// A [`WATCHED_FROM`] block: a write-watched reservation, committed and
+/// zeroed by the system, with the header before the user address.
+fn alloc_watched(layout: Layout) -> *mut c_void {
+    let align = layout.align();
+    // The reservation is 64 KiB aligned; a bigger alignment needs room to
+    // move the user address up.
+    let extra = align.saturating_sub(PAGE);
+    let Some(bytes) = layout.size().checked_add(extra) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a fresh reservation of our own.
+    unsafe {
+        let base = VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE).cast::<u8>();
+        if base.is_null() {
+            return std::ptr::null_mut();
+        }
+        // `layout` holds `align` bytes before the user's `size`.
+        let user = (base as usize + align).next_multiple_of(align) as *mut u8;
+        let offset = user as usize - base as usize;
+        user.sub(HEADER).cast::<[usize; 2]>().write([layout.size(), offset | WATCHED]);
+        user.cast()
+    }
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -323,6 +374,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & WATCHED != 0 {
+            VirtualFree(user.sub(align & !WATCHED).cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

@@ -913,6 +913,9 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Set when the memory is a write-watched reservation of its own
+    /// ([`Memory::new`]): its base, released on drop.
+    reserved: Option<NonNull<u8>>,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -976,6 +979,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            reserved: None,
         })
     }
 
@@ -995,6 +999,29 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        // From 64 KiB on: a write-watched reservation, so that the host
+        // copies of buffers in it are refreshed by the pages the title
+        // wrote, not whole at every submission that reads them (memory of
+        // the host heap cannot be watched). Heaps the title makes through
+        // the device get their memory here. `VICTORY_HEAP_WATCH=0`: the
+        // host heap, as before.
+        if layout.size() >= KIB_64 as usize && watched_memory() {
+            let extra = layout.align().saturating_sub(KIB_64 as usize);
+            let bytes = layout.size().checked_add(extra).ok_or(E_OUTOFMEMORY)?;
+            // SAFETY: a fresh reservation of our own, zeroed by the system.
+            let base = unsafe {
+                use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+                VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT | 0x20_0000 /* MEM_WRITE_WATCH */, PAGE_READWRITE)
+            };
+            let base = NonNull::new(base.cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+            let at = (base.as_ptr() as usize).next_multiple_of(layout.align());
+            // SAFETY: inside the reservation (`extra` covers the move).
+            let ptr = unsafe { base.add(at - base.as_ptr() as usize) };
+            if info.size >= 32 << 20 {
+                tracing::info!(mb = info.size >> 20, at = ?ptr, "memory for the title from our allocator (a heap or a descriptor heap), write-watched");
+            }
+            return Ok(Memory { ptr, layout, attributes: None, reserved: Some(base) });
+        }
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
@@ -1007,12 +1034,27 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            reserved: None,
         })
     }
 }
 
+/// Whether [`Memory::new`] gives write-watched reservations (on unless
+/// `VICTORY_HEAP_WATCH=0`).
+fn watched_memory() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WATCH").is_none_or(|v| v != "0"))
+}
+
 impl Drop for Memory {
     fn drop(&mut self) {
+        if let Some(base) = self.reserved {
+            // SAFETY: our own reservation, made in `new`.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualFree(base.as_ptr().cast(), 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            }
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

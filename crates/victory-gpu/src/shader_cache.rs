@@ -37,13 +37,28 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+include!(concat!(env!("OUT_DIR"), "/shader_source.rs"));
+
+/// Whether the key is the BLAKE3 of our executable file, as before
+/// (`VICTORY_SHADER_CACHE_KEY=exe`), not of the translator's sources.
+fn exe_key() -> bool {
+    std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe")
+}
+
+/// What identifies this build's translations: a hash of the translator's
+/// sources ([`SHADER_SOURCE`], made by build.rs over victory-shader, this
+/// file and the lock file) and of the settings it runs with (the loop
+/// limit, the view heap's null slot, the host's wave width, every
+/// `VICTORY_*` switch the translator reads).
+///
+/// It was the BLAKE3 of our whole executable: every rebuild, whatever it
+/// changed, made every cached translation stale, and the next run
+/// translated every shader again (up to 0.4 s each, over 1,200 pipelines
+/// for the first world frame) and had the driver compile them again, in
+/// the frames that wanted them.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -51,45 +66,60 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // So is the view heap's null slot (it differs by host GPU):
-                // a translation cached without the clamp must not be served.
-                crate::descriptor::host::probe_view_limit();
-                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
+        let mut bytes = if exe_key() {
+            match std::env::current_exe().and_then(std::fs::read) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // Without it no entry can be trusted: a fresh key per run.
+                    tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    return *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes();
                 }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
             }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
+        } else {
+            let mut bytes = b"sources ".to_vec();
+            bytes.extend_from_slice(&SHADER_SOURCE.to_le_bytes());
+            bytes.push(u8::from(cfg!(feature = "diagnostics")));
+            bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
+            for name in SHADER_SWITCHES {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b'=');
+                if let Some(value) = std::env::var_os(name) {
+                    bytes.extend_from_slice(value.as_encoded_bytes());
+                }
+                bytes.push(0);
             }
+            bytes
+        };
+        bytes.extend_from_slice(&limit.to_le_bytes());
+        // So is the view heap's null slot (it differs by host GPU):
+        // a translation cached without the clamp must not be served.
+        crate::descriptor::host::probe_view_limit();
+        bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+        // Which group barriers wait is part of the translation too.
+        bytes.push(victory_shader::emit::group_sync());
+        // So are the switches that pick the form of a wave64 program:
+        // without them here a run with `VICTORY_WAVE_WIDE=0` was
+        // served the translations an earlier run of the same
+        // executable had cached with the switch unset.
+        for name in [
+            "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_F16_NEAREST",
+        ] {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(value.as_encoded_bytes());
+            }
+            bytes.push(0);
         }
+        // And which clean-up passes ran over the translated code.
+        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        *blake3::hash(&bytes).as_bytes()
     })
 }
 
