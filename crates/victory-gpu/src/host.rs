@@ -7120,7 +7120,7 @@ impl Meter {
             copies: [copies, joined],
             twin_copies: twin_to_depth + twin_to_colour + planes,
             card_sent_mb: card[0] as f64 / 1e6 / frames,
-            making: crate::pipeline::making() as u64,
+            making: crate::pipeline::making(),
             #[cfg(feature = "diagnostics")]
             drops: drops.iter().map(|(why, n)| (why.clone(), *n as f64 / frames)).collect(),
             #[cfg(not(feature = "diagnostics"))]
