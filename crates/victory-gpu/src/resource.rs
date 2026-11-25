@@ -1409,7 +1409,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
-            && r.desc.sample_count <= 1;
+            && r.desc.sample_count <= 1
+            // Not one whose largest levels are left out
+            // (`VICTORY_TEXTURE_DROP_MIPS`): its tiles are cut by the
+            // title's level count, the host texture has fewer.
+            && drop_levels(&r.desc) == 0;
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
