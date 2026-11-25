@@ -77,6 +77,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("ir.rs"),
         include_str!("lib.rs"),
         include_str!("native.rs"),
+        include_str!("range.rs"),
         include_str!("resource.rs"),
         include_str!("spill.rs"),
         include_str!("structure.rs"),
