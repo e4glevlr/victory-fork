@@ -516,8 +516,11 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
 /// Looks at uploaded textures picked by index that found the memory as it
-/// was, and that found it changed (uploaded again), since the start.
-pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// was, and that found it changed (uploaded again), since the start; of
+/// the changed, those found after the scheduled looks
+/// (`VICTORY_HEAP_RECHECK_EVERY`) and those only between the three
+/// windows (`VICTORY_HEAP_RECHECK_WHOLE_MB`).
+pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
@@ -1154,9 +1157,11 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. Its copies
+            // are given as written only to a shader that can store by address.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let memory_writes = writes && (t.address_stores || !write_skip());
+                let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2061,17 +2066,35 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let now = crate::texture::fingerprint(at, len);
+                if now == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                    // Past the last of `RECHECK_FRAMES`: every
+                    // `VICTORY_HEAP_RECHECK_EVERY` frames while unchanged, when set.
+                    let wait = RECHECK_FRAMES.get(usize::from(looks) + 1).copied();
+                    match wait.or_else(|| Some(crate::texture::recheck_every()).filter(|&n| n > 0)) {
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks.saturating_add(1),
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                // What only the recheck switches found: a change after the
+                // scheduled looks, and one between the three windows.
+                if usize::from(looks) >= RECHECK_FRAMES.len() {
+                    HEAP_TEXTURES_RECHECKED[2].fetch_add(1, Ordering::Relaxed);
+                }
+                if crate::texture::fingerprint_split(len) && crate::texture::windows_same(now, print) {
+                    HEAP_TEXTURES_RECHECKED[3].fetch_add(1, Ordering::Relaxed);
+                }
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
                         slot = index,
@@ -2340,6 +2363,41 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if self.ambient(list, p) {
+            // The pass bound its own heap, root signature and pipeline:
+            // the next draw or dispatch binds the title's again.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the stand-in for indirect light
+    /// ([`crate::ambient`]), if `p` is the program that resolves it and
+    /// the stand-in is on. Whether anything was recorded.
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        if crate::ambient::level().is_none() {
+            return false;
+        }
+        let (slot, offset) = crate::ambient::LIGHT;
+        let named = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        let light = match self.roots_ref(true).get(usize::from(slot)) {
+            Some(Root::Table(table)) if named => match crate::descriptor::view(table + u64::from(offset) * 4) {
+                Some(View::Unordered(r, ..)) => r,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no stand-in for indirect light: the resolve's tables are not as expected");
+            return false;
+        }
+        crate::ambient::replace(list, light as This)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
