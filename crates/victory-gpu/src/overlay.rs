@@ -88,6 +88,18 @@ pub(crate) struct Stats {
     pub drops: Vec<(String, f64)>,
 }
 
+/// Optional testing code/label shown on screen (`VICTORY_TEST_TAG`).
+pub(crate) fn test_tag() -> Option<&'static str> {
+    static TAG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| {
+        std::env::var("VICTORY_TEST_TAG")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    })
+    .as_deref()
+}
+
 /// The panel's lines (colour, text) for the last second, and a count that
 /// changes with them.
 static LINES: Mutex<(u64, Vec<(u32, String)>)> = Mutex::new((0, Vec::new()));
@@ -156,6 +168,13 @@ pub(crate) fn presented(width: u32, height: u32) -> bool {
         let on = std::env::var_os("VICTORY_OVERLAY").is_none_or(|v| v != "0");
         SHOWN.store(on, Ordering::Relaxed);
         tracing::info!(shown = on, "overlay (F3 shows or hides it)");
+        if let Some(tag) = test_tag() {
+            let mut shown = LINES.lock().unwrap_or_else(|e| e.into_inner());
+            if shown.1.is_empty() {
+                shown.0 += 1;
+                shown.1 = vec![(YELLOW, format!("TESTING: {tag}"))];
+            }
+        }
     });
     SIZE.store(
         u64::from(width) << 32 | u64::from(height),
@@ -257,6 +276,9 @@ fn processor() -> (f64, f64) {
 /// The panel's lines and their colours.
 fn lines(s: &Stats) -> Vec<(u32, String)> {
     let mut out = Vec::new();
+    if let Some(tag) = test_tag() {
+        out.push((YELLOW, format!("TESTING: {tag}")));
+    }
     let [count, total_ms, max_ms] = [0, 1, 2].map(|i| SLOW[i].load(Ordering::Relaxed));
     static CARD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let card = CARD.get_or_init(|| {

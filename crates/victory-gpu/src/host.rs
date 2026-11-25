@@ -4654,6 +4654,40 @@ impl Host {
                         // Ensure `view_writes` is zeroed before the next flight's shaders run.
                         list.ResourceBarrier(&[uav_bar()]);
                     }
+                    // The fetch inside the flight (`inflight_fetch`): behind
+                    // every compare of the list, the pieces they flagged go
+                    // to slots in the PC's memory.
+                    if flown && let Some(inflight) = &work.inflight {
+                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                    pResource: std::mem::ManuallyDrop::new(None),
+                                }),
+                            },
+                        }]);
+                        list.SetComputeRootSignature(&inflight.root);
+                        list.SetPipelineState(&inflight.pso);
+                        list.SetComputeRootUnorderedAccessView(2, work.differs.0.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(3, inflight.table.0.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(4, inflight.fetched.0.GetGPUVirtualAddress());
+                        let mut every = true;
+                        for r in plan.ranges.iter().filter(|r| r.compared) {
+                            let Some((_, Some(_), size)) = r.shadow.card_sides() else {
+                                every = false;
+                                continue;
+                            };
+                            let groups = r.span.pieces.clamp(1, 65535);
+                            let constants =
+                                [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, inflight.landed, inflight.fetched.2, groups];
+                            list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            list.Dispatch(groups, 1, 1);
+                        }
+                        plan.inflight = every;
+                        plan.inflight_landed = inflight.landed;
+                    }
                     list.Close()?;
                     list.cast()
                 })()
@@ -8094,8 +8128,11 @@ impl Meter {
             .map(|m| m.map(|b| b >> 20))
             .unwrap_or([0; 4]);
         let (ws_bytes, _) = process_memory();
+        let tag = crate::overlay::test_tag()
+            .map(|t| format!(" [TESTING: {t}]"))
+            .unwrap_or_default();
         let text = format!(
-            " | VIctory {fps:.1} fps (1% {low1:.1}) {ms:.1}ms [p95:{p95:.1} max:{max_ms:.1}] | \
+            "{tag} | VIctory {fps:.1} fps (1% {low1:.1}) {ms:.1}ms [p95:{p95:.1} max:{max_ms:.1}] | \
              prep:{cpu:.0} gpu:{gpu:.0} back:{back_ms:.0} | draws:{draws:.0} drop:{dropped:.0} | \
              VRAM {vram_used}/{vram_bud}MB SH {shared_used}MB RAM {}MB | shd:{} tex:{}",
             ws_bytes >> 20,
