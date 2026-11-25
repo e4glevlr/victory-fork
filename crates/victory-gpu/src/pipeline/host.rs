@@ -91,6 +91,69 @@ impl Default for GraphicsState {
     }
 }
 
+/// Whether the host blends into render targets of `format`. It never does into integer
+/// formats (`R8_UINT`...), where the console's hardware leaves blending out.
+fn blendable(format: DXGI_FORMAT) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(i32, bool)>> = std::sync::Mutex::new(Vec::new());
+    if format == DXGI_FORMAT_UNKNOWN {
+        return true;
+    }
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, b)) = known.iter().find(|k| k.0 == format.0) {
+        return b;
+    }
+    let Some(host) = host() else { return true };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let b = asked.is_err() || support.Support1.0 & D3D12_FORMAT_SUPPORT1_BLENDABLE.0 != 0;
+    if !b {
+        tracing::info!(format = format.0, "the host does not blend into this format: blending off for such targets");
+    }
+    known.push((format.0, b));
+    b
+}
+
+/// The blend state the host takes for `g`: the title's, with blending off for the
+/// render targets whose format the host does not blend into. The console's hardware
+/// ignores blending there, and the host refuses the pipeline (E_INVALIDARG: the
+/// windshield wiper mask blends MAX into an `R8_UINT` target).
+pub(crate) fn host_blend(g: &GraphicsState) -> D3D12_BLEND_DESC {
+    blend_where(g, blendable)
+}
+
+/// [`host_blend`] with `blendable` telling which formats the host blends into.
+fn blend_where(g: &GraphicsState, blendable: impl Fn(DXGI_FORMAT) -> bool) -> D3D12_BLEND_DESC {
+    let mut b = g.blend;
+    let n = (g.targets.NumRenderTargets as usize).min(8);
+    let rt = |b: &D3D12_BLEND_DESC, i: usize| {
+        if b.IndependentBlendEnable.as_bool() { b.RenderTarget[i] } else { b.RenderTarget[0] }
+    };
+    let off: Vec<usize> = (0..n)
+        .filter(|&i| rt(&b, i).BlendEnable.as_bool() && !blendable(g.targets.RTFormats[i]))
+        .collect();
+    // (A logic operation keeps the shared description: it needs one.)
+    if off.is_empty() || (0..n).any(|i| rt(&b, i).LogicOpEnable.as_bool()) {
+        return b;
+    }
+    if !b.IndependentBlendEnable.as_bool() {
+        b.IndependentBlendEnable = true.into();
+        for i in 1..8 {
+            b.RenderTarget[i] = b.RenderTarget[0];
+        }
+    }
+    for i in off {
+        b.RenderTarget[i].BlendEnable = false.into();
+    }
+    b
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -686,7 +749,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: host_blend(g),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -933,7 +996,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -952,7 +1015,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1367,5 +1430,48 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    fn state(independent: bool, formats: &[DXGI_FORMAT]) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        let max = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_ONE,
+            BlendOp: D3D12_BLEND_OP_MAX,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: 15,
+        };
+        g.blend.RenderTarget = [max; 8];
+        g.targets.NumRenderTargets = formats.len() as u32;
+        g.targets.RTFormats[..formats.len()].copy_from_slice(formats);
+        g
+    }
+
+    /// The windshield wiper mask: MAX into R32_FLOAT, B4G4R4A4 and R8_UINT.
+    #[test]
+    fn integer_targets_take_no_blending() {
+        let not_uint = |f: DXGI_FORMAT| f != DXGI_FORMAT_R8_UINT;
+        let formats = [DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_R8_UINT];
+        for independent in [true, false] {
+            let b = blend_where(&state(independent, &formats), not_uint);
+            let on: Vec<bool> = b.RenderTarget[..3].iter().map(|t| t.BlendEnable.as_bool()).collect();
+            assert_eq!(on, [true, true, false], "independent {independent}");
+            assert!(b.IndependentBlendEnable.as_bool());
+            assert_eq!(b.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX, "the others keep their blending");
+        }
+        // Nothing to change: the title's state as it is.
+        let g = state(false, &[DXGI_FORMAT_R32_FLOAT]);
+        assert!(!blend_where(&g, not_uint).IndependentBlendEnable.as_bool());
     }
 }
