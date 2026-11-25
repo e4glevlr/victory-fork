@@ -823,9 +823,10 @@ fn same_target_conditional_branch_keeps_both_edge_blocks() {
         root(RootType::Constants, 1, 1),
     ];
     let out = lower_with(&words, layout, vec![]).unwrap();
-    // Block 0 -> block 2 (1 edge) + block 1 -> block 2 (2 distinct edges) = 3 edge blocks.
-    // Previously the second edge from block 1 overwrote the first (leaving only 2).
-    assert_eq!(out.edge_blocks, 3);
+    // The IR folds block 1's branch to its fallthrough (both targets are
+    // block 2), so block 1 jumps to block 2 and only block 0's edge needs
+    // a block of its own.
+    assert_eq!(out.edge_blocks, 1);
 }
 
 #[test]
