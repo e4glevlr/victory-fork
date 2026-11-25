@@ -50,6 +50,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/bitcode/opt.rs"),
         include_str!("emit/container.rs"),
         include_str!("emit/descriptor_data.rs"),
+        include_str!("emit/halves.rs"),
         include_str!("emit/descriptor_tests.rs"),
         include_str!("emit/diff_tests.rs"),
         include_str!("emit/float64.rs"),
