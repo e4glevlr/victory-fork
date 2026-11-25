@@ -2165,6 +2165,7 @@ mod title_memory_tests {
             detiled: std::sync::atomic::AtomicU32::new(0),
             judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
             waiting: std::sync::atomic::AtomicU64::new(0),
+            pooled: 0,
         };
 
         // Fresh Staging has not detiled yet -> must not report `Some(0)` to Tiled::uploaded.

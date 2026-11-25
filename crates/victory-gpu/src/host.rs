@@ -10358,7 +10358,7 @@ void main() {
             unsafe { dword(from(k)).write_volatile(titles(k)) };
             let list = host.new_list().expect("a host list");
             shadow.refresh(&list, title as u64, LEN as u64);
-            shadow.gpu_writes(&list, (title as usize + (30 + k) * PIECE) as u64, PIECE as u64);
+            shadow.gpu_writes(&list, (title as usize + (30 + k) * PIECE) as u64, PIECE as u64, false);
             // SAFETY: an open list; the copy's buffer, with unordered
             // access; the shader's own root signature.
             unsafe {
@@ -10511,7 +10511,7 @@ void main() {
         let record = |piece: usize, first: u32, last: u32, spin: u32| {
             let list = host.new_list().expect("a host list");
             shadow.refresh(&list, title as u64, LEN as u64);
-            shadow.gpu_writes(&list, (title as usize + piece * PIECE) as u64, PIECE as u64);
+            shadow.gpu_writes(&list, (title as usize + piece * PIECE) as u64, PIECE as u64, false);
             // SAFETY: an open list; the copy's buffer, with unordered
             // access; the shader's own root signature.
             unsafe {

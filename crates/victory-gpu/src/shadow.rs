@@ -2183,7 +2183,7 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs, join_runs};
+    use super::{PIECE, SNAPS, back_piece, changed_runs, give_back, join_runs, pooled, take_snapshots};
 
     /// Runs with fewer bytes between them than the gap become one, from the
     /// first's start to the last's end; the others stay as they are.
@@ -2323,6 +2323,22 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+    #[test]
+    fn take_snapshots_flushes_queued_snaps_before_release() {
+        let src = vec![0x5Au8; 64 << 10];
+        let mut dst = pooled(32 << 10);
+        // SAFETY: `pooled` returns a Vec of at least 32 KiB capacity.
+        unsafe { dst.set_len(32 << 10) };
+        SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push((
+            src.as_ptr() as usize,
+            dst.as_mut_ptr() as usize,
+            32 << 10,
+        ));
+        take_snapshots();
+        assert!(dst.iter().all(|&b| b == 0x5A));
+        assert!(SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        give_back(dst);
+    }
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
@@ -2331,6 +2347,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if wide_back() && !SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            take_snapshots();
+        }
         if let Some((base, count)) = self.marks.take() {
             give_marks(base, count);
         }
@@ -3911,77 +3930,97 @@ impl Shadow {
                 .filter(|&(a, b)| a < end && b > at)
                 .collect()
         };
-        self.merge_card_relay_span(start, at, gpu, held, skip, title)
+        merge_card_relay_span_with(Some(self), start, at, gpu, held, skip, title)
     }
 }
 
-impl Shadow {
-    /// Merges `gpu` into `held` and mapped title memory at `start + at` for
-    /// every sub-range outside `skip`, trimming each sub-range to its differing
-    /// bytes so skipped or untouched regions are never read or overwritten, and
-    /// falling back to 4 KiB page granularity if a sub-range contains an
-    /// unmapped page so neighboring mapped pages still receive their writes.
-    fn merge_card_relay_span(
-        &self,
-        start: usize,
-        at: usize,
-        gpu: &[u8],
-        held: &mut [u8],
-        skip: Vec<(usize, usize)>,
-        title: &mut Vec<u8>,
-    ) -> usize {
-        let mut written = 0usize;
-        for (a, b) in outside(at, at + gpu.len(), skip) {
-            let (sub_gpu, sub_held) = (&gpu[a - at..b - at], &mut held[a - at..b - at]);
-            let Some(first) = first_difference(sub_gpu, sub_held) else {
-                continue;
-            };
-            let last = last_difference(sub_gpu, sub_held).unwrap_or(first);
-            let (sub_at, sub_n) = (a + first, last + 1 - first);
-            let (sub_gpu, sub_held) = (&sub_gpu[first..=last], &mut sub_held[first..=last]);
-            title.clear();
-            title.resize(sub_n, 0);
-            if crate::host::read_into((start + sub_at) as *const u8, title) {
-                let as_read = merge_race_on().then(|| title.clone());
-                if merge_piece(sub_gpu, sub_held, title) {
+/// Merges `gpu` into `held` and mapped title memory at `start + at` for
+/// every sub-range outside `skip`, trimming each sub-range to its differing
+/// bytes so skipped or untouched regions are never read or overwritten, and
+/// falling back to 4 KiB page granularity if a sub-range contains an
+/// unmapped page so neighboring mapped pages still receive their writes.
+#[cfg(test)]
+fn merge_card_relay_span(
+    start: usize,
+    at: usize,
+    gpu: &[u8],
+    held: &mut [u8],
+    skip: Vec<(usize, usize)>,
+    title: &mut Vec<u8>,
+) -> usize {
+    merge_card_relay_span_with(None, start, at, gpu, held, skip, title)
+}
+
+fn merge_card_relay_span_with(
+    shadow: Option<&Shadow>,
+    start: usize,
+    at: usize,
+    gpu: &[u8],
+    held: &mut [u8],
+    skip: Vec<(usize, usize)>,
+    title: &mut Vec<u8>,
+) -> usize {
+    let mut written = 0usize;
+    for (a, b) in outside(at, at + gpu.len(), skip) {
+        let (sub_gpu, sub_held) = (&gpu[a - at..b - at], &mut held[a - at..b - at]);
+        let Some(first) = first_difference(sub_gpu, sub_held) else {
+            continue;
+        };
+        let last = last_difference(sub_gpu, sub_held).unwrap_or(first);
+        let (sub_at, sub_n) = (a + first, last + 1 - first);
+        let (sub_gpu, sub_held) = (&sub_gpu[first..=last], &mut sub_held[first..=last]);
+        title.clear();
+        title.resize(sub_n, 0);
+        if crate::host::read_into((start + sub_at) as *const u8, title) {
+            let as_read = (shadow.is_some() && merge_race_on()).then(|| title.clone());
+            if merge_piece(sub_gpu, sub_held, title) {
+                if let Some(s) = shadow {
                     crate::host::shaders_write(start + sub_at, &title[..]);
-                    if !self.put_back_own(start + sub_at, &title[..]) {
+                    if !s.put_back_own(start + sub_at, &title[..]) {
                         crate::watch::writing(start + sub_at, sub_n);
-                        merge_race(as_read.as_deref(), (self.start, self.len), start + sub_at, &title[..], "card relay");
+                        merge_race(as_read.as_deref(), (s.start, s.len), start + sub_at, &title[..], "card relay");
                         crate::host::write_mapped((start + sub_at) as *mut u8, title.as_ptr(), sub_n);
                     }
-                    written += sub_n;
+                } else {
+                    crate::watch::writing(start + sub_at, sub_n);
+                    crate::host::write_mapped((start + sub_at) as *mut u8, title.as_ptr(), sub_n);
                 }
-            } else {
-                const OS_PAGE: usize = 4096;
-                let mut pos = 0usize;
-                while pos < sub_n {
-                    let addr = start + sub_at + pos;
-                    let chunk = (OS_PAGE - (addr % OS_PAGE)).min(sub_n - pos);
-                    title.clear();
-                    title.resize(chunk, 0);
-                    let mapped = crate::host::read_into(addr as *const u8, title);
-                    let as_read = (mapped && merge_race_on()).then(|| title.clone());
-                    let changed = merge_piece(
-                        &sub_gpu[pos..pos + chunk],
-                        &mut sub_held[pos..pos + chunk],
-                        title,
-                    );
-                    if mapped && changed {
+                written += sub_n;
+            }
+        } else {
+            const OS_PAGE: usize = 4096;
+            let mut pos = 0usize;
+            while pos < sub_n {
+                let addr = start + sub_at + pos;
+                let chunk = (OS_PAGE - (addr % OS_PAGE)).min(sub_n - pos);
+                title.clear();
+                title.resize(chunk, 0);
+                let mapped = crate::host::read_into(addr as *const u8, title);
+                let as_read = (mapped && shadow.is_some() && merge_race_on()).then(|| title.clone());
+                let changed = merge_piece(
+                    &sub_gpu[pos..pos + chunk],
+                    &mut sub_held[pos..pos + chunk],
+                    title,
+                );
+                if mapped && changed {
+                    if let Some(s) = shadow {
                         crate::host::shaders_write(addr, &title[..]);
-                        if !self.put_back_own(addr, &title[..]) {
+                        if !s.put_back_own(addr, &title[..]) {
                             crate::watch::writing(addr, chunk);
-                            merge_race(as_read.as_deref(), (self.start, self.len), addr, &title[..], "card relay");
+                            merge_race(as_read.as_deref(), (s.start, s.len), addr, &title[..], "card relay");
                             crate::host::write_mapped(addr as *mut u8, title.as_ptr(), chunk);
                         }
-                        written += chunk;
+                    } else {
+                        crate::watch::writing(addr, chunk);
+                        crate::host::write_mapped(addr as *mut u8, title.as_ptr(), chunk);
                     }
-                    pos += chunk;
+                    written += chunk;
                 }
+                pos += chunk;
             }
         }
-        written
     }
+    written
 }
 
 struct Entry {

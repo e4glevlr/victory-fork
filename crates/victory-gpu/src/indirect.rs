@@ -402,7 +402,7 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
 }
 
 /// Bits of the clamp's `has_count`.
-const AHEAD: u32 = 2;
+pub(super) const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -1455,7 +1455,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1502,7 +1502,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1709,7 +1709,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
-            false,
+            0,
         ));
 
         // SAFETY: open command list; copy clamped scratch buffer (left
@@ -1895,7 +1895,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_DRAW, STRIDE, counts.len() as u32),
-            false,
+            0,
         ));
         // SAFETY: an open list; the clamped records are copied for the check.
         unsafe {
@@ -2137,7 +2137,7 @@ void main() {
                 (src, 0),
                 None,
                 (KIND_DISPATCH, STEP, groups.len() as u32),
-                true,
+                AHEAD,
             ));
             state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
             // SAFETY: an open list; the worker's root signature and

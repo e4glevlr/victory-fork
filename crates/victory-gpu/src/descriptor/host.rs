@@ -592,6 +592,19 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// `VICTORY_TABLED_SKIP_FRAMES=<n>`: a slot is left to its draws only if a
+/// draw read it through a table within the last `n` frames (0: such slots
+/// are mirrored again, as with `VICTORY_HEAP_SYNC_TABLES=1`). Unset: the
+/// window is [`TABLED_FRAMES`] and the read bit is not asked for.
+fn skip_frames() -> Option<u64> {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TABLED_SKIP_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1802,10 +1815,24 @@ impl HostHeap {
     /// Whether title slot `index` was a table's within the last
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
+    ///
+    /// `VICTORY_TABLED_SKIP_FRAMES=<n>` asks the stricter question the
+    /// mirror pass needs: a slot may be left to its draws only if a draw
+    /// read it **through a table** within the last `n` frames, because only
+    /// then did that draw make its own view of it. Without the read bit the
+    /// window of [`TABLED_FRAMES`] (240) also lets a slot the title stopped
+    /// using through a table be written directly while the mirror skips it,
+    /// and a draw then reads a record no pass made.
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
-        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let stamp = self.tabled_stamp(index);
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        if let Some(frames) = skip_frames() {
+            return stamp & TABLED_READ != 0
+                && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= frames;
+        }
+        tabled_out()
+            && stamp & !TABLED_READ != 0
+            && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -2124,7 +2151,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_view_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -3140,6 +3167,21 @@ fn twin_uav(
         (other, _) => other,
     };
     Some(desc)
+}
+
+/// The size of a constant buffer view the host takes: 256-byte steps, and
+/// at most 4,096 vectors (65,536 bytes, `D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`).
+/// `CreateConstantBufferView` with a larger size is an invalid call, and
+/// NVIDIA removes the device for it (`DXGI_ERROR_INVALID_CALL`). A shader reads
+/// at most 4,096 vectors through a constant view, so nothing it can read is lost.
+fn constant_view_size(size: u32) -> u32 {
+    const MOST: u32 = 4096 * 16;
+    let sized = size.max(1).next_multiple_of(256);
+    if sized > MOST {
+        once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
+        return MOST;
+    }
+    sized
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -4678,31 +4720,6 @@ mod record_print_tests {
 }
 
 #[cfg(test)]
-mod record_print_tests {
-    use super::record_print;
-
-    /// Equal records print alike; a record that differs in any one byte,
-    /// or in its length, prints otherwise.
-    #[test]
-    fn a_record_that_changed_prints_otherwise() {
-        let record: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(5)).collect();
-        let print = record_print(&record);
-        assert_eq!(print, record_print(&record.clone()));
-        for at in 0..32 {
-            for bit in 0..8 {
-                let mut other = record.clone();
-                other[at] ^= 1 << bit;
-                assert_ne!(record_print(&other), print, "byte {at} bit {bit}");
-            }
-        }
-        assert_ne!(record_print(&record[..16]), print);
-        assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
-        // A record of zeros is told from "never looked at" by the caller's `| 1`.
-        assert_ne!(record_print(&[0u8; 32]) | 1, 0);
-    }
-}
-
-#[cfg(test)]
 mod own_copy_tests {
     use super::own_bytes_if;
 
@@ -4756,5 +4773,16 @@ mod own_copy_tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A constant view is made in 256-byte steps and at most 64 KiB, the
+    /// most the host takes (a larger size removes the device on NVIDIA).
+    #[test]
+    fn constant_views_are_at_most_64_kib() {
+        assert_eq!(super::constant_view_size(0), 256);
+        assert_eq!(super::constant_view_size(16), 256);
+        assert_eq!(super::constant_view_size(256), 256);
+        assert_eq!(super::constant_view_size(65_536), 65_536);
+        assert_eq!(super::constant_view_size(1_306_368), 65_536);
     }
 }
