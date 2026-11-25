@@ -193,11 +193,13 @@ pub fn build_bounded(
         let mut fields = machine.fields(wave64);
         // A move to or from a scalar parked in a VGPR lane (`unspill`): its register
         // codes may be ones the machine word cannot hold.
+        let mut is_parked = false;
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
             && let Fields::Sop { dst: Some(Operand::Scalar { code: to, .. }), src, .. } = &mut fields
             && let Some(Operand::Scalar { code: from, .. }) = src.first_mut()
         {
             (*to, *from) = (parked[k].1, parked[k].2);
+            is_parked = true;
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         // A conditional SOPP branch to fallthrough has no register effects
@@ -223,7 +225,7 @@ pub fn build_bounded(
             };
         }
         let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
+        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0, is_parked)? {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {
@@ -312,7 +314,7 @@ fn unspill(
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
         let m0 = m0_max.get(&inst.offset).copied();
-        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs, m0) else {
+        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs, m0, false) else {
             return Vec::new();
         };
         let mut codes = Vec::new();
@@ -339,7 +341,8 @@ fn unspill(
                     continue;
                 }
                 match reg {
-                    Reg::S(c) => used[usize::from(c)] = true,
+                    Reg::S(c) if usize::from(c) < used.len() => used[usize::from(c)] = true,
+                    Reg::S(_) => {}
                     Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
                     Reg::V(r) => other[usize::from(r)] = true,
                     Reg::Scc => {}
@@ -1214,6 +1217,7 @@ pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
         lanes,
         p.vgprs,
         None,
+        true,
     )
     .ok()
     .flatten()
@@ -1233,6 +1237,7 @@ fn effects(
     lanes: u8,
     vgprs: u16,
     m0_max: Option<u8>,
+    allow_parked: bool,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -1244,7 +1249,7 @@ fn effects(
     let mask = |code: u8| (0..lanes).map(move |i| Reg::S(code + i));
     let (mut r, mut w) = (Vec::new(), Vec::new());
     let regs = |op: &Operand, out: &mut Vec<Reg>| {
-        add_regs(op, lanes, out).map_err(|_| ShaderError::Isa {
+        add_regs(op, lanes, allow_parked, out).map_err(|_| ShaderError::Isa {
             offset: inst.offset,
             reason: "register range out of bounds",
         })
@@ -1570,14 +1575,19 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
 
 /// Appends the register dwords an operand names; reading `vccz`, `execz`,
 /// `scc` or `lds_direct` reads the register behind it.
-fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
+fn add_regs(op: &Operand, lanes: u8, allow_parked: bool, out: &mut Vec<Reg>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
             let end = u16::from(code) + u16::from(dwords);
-            // A machine operand ends within the machine's codes, a parked
-            // scalar (`unspill`) within those past them.
-            let limit = if code < PARKED { 128 } else { 256 };
+            // Before `unspill`, every scalar operand must lie within the
+            // machine's codes (`0..PARKED`); after it, parked scalars use
+            // `PARKED..256`.
+            let limit = if allow_parked && code >= PARKED {
+                256
+            } else {
+                u16::from(PARKED)
+            };
             if end > limit {
                 return Err(());
             }
@@ -2063,5 +2073,29 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn rejects_scalar_destination_past_machine_codes_without_panicking() {
+        // VOP3 v_cmp_eq_u32 with vdst = 0x80 (128 == PARKED) and VOP1
+        // v_readfirstlane_b32 with vdst = 0x80 must return ShaderError::Isa
+        // instead of panicking inside `unspill`.
+        let cases = [
+            vec![0xD4C2_0080u32, 0x0002_0300, S_ENDPGM],
+            vec![0x7F00_0500u32, S_ENDPGM],
+        ];
+        for words in cases {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            for wave64 in [false, true] {
+                assert_eq!(
+                    build(&code, wave64, 16),
+                    Err(ShaderError::Isa {
+                        offset: 0,
+                        reason: "register range out of bounds",
+                    }),
+                    "{words:08x?} wave64={wave64}"
+                );
+            }
+        }
     }
 }
