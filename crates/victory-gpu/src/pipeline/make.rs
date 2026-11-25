@@ -30,13 +30,13 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
-    /// Whether a draw or dispatch has requested it yet.
+    /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
     /// First title frame in which a recording thread waited on this pipeline
-    /// (`u64::MAX`: never waited yet). Caps waiting to one frame per pipeline
-    /// so a slow shader compiles asynchronously without stalling every later
-    /// frame for the full wait budget.
+    /// (`u64::MAX`: never waited yet). When `VICTORY_PIPELINE_WAIT_ONCE=1`,
+    /// waiting is capped to one frame per pipeline so slow compiles finish
+    /// asynchronously without stalling later frames for the wait budget.
     waited_frame: AtomicU64,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
@@ -239,6 +239,30 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Whether a pending pipeline only consumes the synchronous wait budget on
+/// its first frame (`VICTORY_PIPELINE_WAIT_ONCE=1`; off by default so later
+/// frames keep waiting within the budget instead of dropping draws).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether `ready` should wait for `p` on `frame` given `once` (`wait_once`).
+fn should_wait(p: &Pending, frame: u64, once: bool) -> bool {
+    if !once {
+        return true;
+    }
+    match p.waited_frame.compare_exchange(
+        u64::MAX,
+        frame,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => true,
+        Err(first) => first == frame,
+    }
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -253,16 +277,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         let frame = crate::frame::current();
-        let first = match p.waited_frame.compare_exchange(
-            u64::MAX,
-            frame,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => frame,
-            Err(f) => f,
-        };
-        if first == frame {
+        if should_wait(p, frame, wait_once()) {
             wait(p, frame);
         }
     }
@@ -602,20 +617,15 @@ mod tests {
 
     #[test]
     fn slow_pipeline_waits_at_most_one_frame() {
-        let mut p = Pending::new(Vec::new(), None);
-        p.key = "slow-pipeline-one-frame-test".to_owned();
-        // Simulate a pipeline already claimed by a worker that has not finished.
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        let first_frame = crate::frame::current();
-        // Pretend it already exhausted its wait on another frame (avoid u64::MAX sentinel).
-        let earlier_frame = if first_frame == 0 { 1 } else { first_frame - 1 };
-        p.waited_frame.store(earlier_frame, Ordering::Relaxed);
-        let p = Arc::new(p);
-        let started = Instant::now();
-        assert!(ready(&p).is_none());
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "subsequent frames must not block for the pipeline wait budget"
-        );
+        let p = Pending::new(Vec::new(), None);
+        // Default (`once = false`): every frame waits within the budget.
+        assert!(should_wait(&p, 10, false));
+        assert!(should_wait(&p, 11, false));
+
+        // Opt-in (`once = true`): first frame waits (including repeat checks),
+        // subsequent frames return immediately without waiting.
+        assert!(should_wait(&p, 12, true));
+        assert!(should_wait(&p, 12, true));
+        assert!(!should_wait(&p, 13, true));
     }
 }
