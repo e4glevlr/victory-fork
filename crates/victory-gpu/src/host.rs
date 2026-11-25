@@ -3028,12 +3028,14 @@ fn relay_hand_back(back: &[Declared], plans: &[&CardPlan], all_had_card: bool) {
 }
 
 /// For the frame-rate line, with [`late`]: what the line of flights did
-/// per frame since the last one.
-fn late_line(frames: f64) {
+/// per frame since the last one. Flights and settles per frame and the ms
+/// settles waited for the card (for the overlay).
+fn late_line(frames: f64) -> [f64; 3] {
     if !late() {
-        return;
+        return [0.0; 3];
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let figures = [s[0], s[1], s[12] / 1000.0];
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
@@ -3112,6 +3114,7 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    figures
 }
 
 #[cfg(test)]
@@ -6982,9 +6985,9 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
-        late_line(frames);
+        let [flights, settles, settle_ms] = late_line(frames);
         let [card_busy, idle_behind, stood] = card_clock_line(frames, ms);
-        crate::shadow::back_line(frames);
+        let scanned_mb = crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
@@ -7041,33 +7044,29 @@ impl Meter {
                 }
             }
         }
-        {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            if all >= 1.0 {
-                tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
-                );
-            }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
-                tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
-                );
-            }
+        let [own, asking, still, all] =
+            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        if all >= 1.0 {
+            tracing::info!(
+                "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                 is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+                 hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+            );
         }
-        {
-            let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if copies > 0.0 {
-                tracing::info!(
-                    "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
-                    if join_copies() { "on" } else { "off" }
-                );
-            }
+        let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if through + left > 0.0 {
+            tracing::info!(
+                "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+            );
+        }
+        let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if copies > 0.0 {
+            tracing::info!(
+                "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
+                 (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                if join_copies() { "on" } else { "off" }
+            );
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
@@ -7100,16 +7099,24 @@ impl Meter {
             copy_mb,
             texture_ms,
             texture_mb,
+            refresh: [all, own, asking, still],
             gpu,
             back_ms,
             back_mb,
+            scanned_mb,
             heap_pass_ms: picked_ms,
+            heap_passes: picked,
             draws,
             dropped,
             indirect,
+            mesh_groups,
             card_busy,
             idle_behind,
             stood,
+            sent_ahead: [flights, settles, settle_ms],
+            copies: [copies, joined],
+            twin_copies: twin_to_depth + twin_to_colour + planes,
+            card_sent_mb: card[0] as f64 / 1e6 / frames,
             making: crate::pipeline::making() as u64,
             #[cfg(feature = "diagnostics")]
             drops: drops.iter().map(|(why, n)| (why.clone(), *n as f64 / frames)).collect(),
@@ -7356,7 +7363,7 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
-            if crate::overlay::presented() {
+            if crate::overlay::presented(width, height) {
                 let at = slot.map_or(0, |i| i + 1);
                 if p.panels.len() <= at {
                     p.panels.resize_with(at + 1, || None);
@@ -7541,6 +7548,14 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The card's name, as the system gives it.
+    pub(crate) fn card_name(&self) -> Option<String> {
+        // SAFETY: a plain query.
+        let desc = unsafe { self.adapter.as_ref()?.GetDesc1() }.ok()?;
+        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        Some(String::from_utf16_lossy(&desc.Description[..len]))
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

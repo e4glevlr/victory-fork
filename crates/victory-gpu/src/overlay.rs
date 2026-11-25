@@ -3,13 +3,20 @@
 //! (`VICTORY_OVERLAY=0` starts with it hidden).
 //!
 //! It holds what the frame-rate line logs, once a second: frames per
-//! second and time per frame; of a frame, the submitting thread's
-//! preparation (title-memory copies, texture refreshes), the GPU's time,
-//! the copy-back of what shaders wrote; how busy the card was and how long
-//! it waited for us; draws, draws dropped, pipelines being made and the
-//! driver's slow compiles; textures picked by index still waiting; process
-//! and video memory. The largest of preparing, GPU and copying back is
-//! named the bottleneck. Below, a bar per frame for the last frames' times.
+//! second, time per frame and the last frames' spread; of a frame, the
+//! submitting thread's preparation (title-memory copies, texture refreshes
+//! and what they waited for), the GPU's time, the copy-back of what shaders
+//! wrote; how busy the card was, how long it waited for us and we for it;
+//! the processor time the process takes; draws, draws dropped and why,
+//! pipelines being made, made and loaded, the driver's slow compiles;
+//! textures picked by index and their queue; title buffer copies; process,
+//! video and shared memory. The largest of preparing, GPU, copying back and
+//! the heap passes in the title's threads is named the bottleneck. Below, a bar
+//! per frame for the last frames' times.
+//!
+//! Each second's panel is also appended to a log, shown or not
+//! (`VICTORY_OVERLAY_LOG=<file>`; by default `overlay.log` in the cache
+//! folder; `0`: none).
 //!
 //! The text is drawn with GDI into a small bitmap once a second; each
 //! present writes the panel into an upload buffer of its own and copies it
@@ -17,6 +24,8 @@
 //! the title draws, and costs about a millisecond of the present thread).
 
 use std::collections::VecDeque;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -41,31 +50,83 @@ pub(crate) struct Stats {
     pub copy_mb: f64,
     pub texture_ms: f64,
     pub texture_mb: f64,
+    /// Texture refreshes on all threads: ms in all, waiting for a texture
+    /// another thread refreshes, asking the write watch, waiting for title
+    /// memory to hold still.
+    pub refresh: [f64; 4],
     pub gpu: f64,
     pub back_ms: f64,
     pub back_mb: f64,
+    /// MB the CPU compared looking for shader writes.
+    pub scanned_mb: f64,
     pub heap_pass_ms: f64,
+    pub heap_passes: f64,
     pub draws: f64,
     pub dropped: f64,
     pub indirect: f64,
+    pub mesh_groups: f64,
     /// Percent of the frame the card had work of ours.
     pub card_busy: f64,
     /// Ms of a frame the card stood idle while the submitting thread worked.
     pub idle_behind: f64,
     /// Ms of a frame the submitting thread stood waiting for the card.
     pub stood: f64,
+    /// Submissions sent ahead: flights, settles, ms settles waited.
+    pub sent_ahead: [f64; 3],
+    /// Title buffer copies recorded, and of them continuing the one before.
+    pub copies: [f64; 2],
+    /// Copies between depth textures and their twins, and planes drawn.
+    pub twin_copies: f64,
+    /// MB sent up to copies in the card's memory.
+    pub card_sent_mb: f64,
     pub making: u64,
     /// The largest reasons draws were dropped (diagnostics builds).
     pub drops: Vec<(String, f64)>,
 }
 
-static STATS: Mutex<Option<(u64, Stats)>> = Mutex::new(None);
-static VERSION: AtomicU64 = AtomicU64::new(0);
+/// The panel's lines (colour, text) for the last second, and a count that
+/// changes with them.
+static LINES: Mutex<(u64, Vec<(u32, String)>)> = Mutex::new((0, Vec::new()));
 
-/// The last second's figures, for the panel.
+/// The last second's figures: the panel's lines, logged.
 pub(crate) fn update(stats: Stats) {
-    let version = VERSION.fetch_add(1, Ordering::Relaxed) + 1;
-    *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some((version, stats));
+    let lines = lines(&stats);
+    log(&lines);
+    let mut shown = LINES.lock().unwrap_or_else(|e| e.into_inner());
+    shown.0 += 1;
+    shown.1 = lines;
+}
+
+/// Appends `lines` to the overlay's log, made afresh at the first call.
+fn log(lines: &[(u32, String)]) {
+    static FILE: Mutex<Option<Option<std::io::BufWriter<std::fs::File>>>> = Mutex::new(None);
+    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let file = file.get_or_insert_with(|| {
+        let path = match std::env::var_os("VICTORY_OVERLAY_LOG") {
+            Some(v) if v == "0" => return None,
+            Some(v) => PathBuf::from(v),
+            None => crate::pipeline::library::dir()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new("."))
+                .join("overlay.log"),
+        };
+        match std::fs::File::create(&path) {
+            Ok(f) => {
+                tracing::info!(path = %path.display(), "overlay log");
+                Some(std::io::BufWriter::new(f))
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "no overlay log");
+                None
+            }
+        }
+    });
+    let Some(file) = file else { return };
+    for (_, text) in lines {
+        let _ = writeln!(file, "{text}");
+    }
+    let _ = writeln!(file);
+    let _ = file.flush();
 }
 
 /// Driver compiles of 2 s or more: how many, their milliseconds in all, the
@@ -79,16 +140,20 @@ static TIMES: Mutex<(Option<Instant>, VecDeque<f32>)> = Mutex::new((None, VecDeq
 
 static SHOWN: AtomicBool = AtomicBool::new(false);
 static KEY_DOWN: AtomicBool = AtomicBool::new(false);
+/// The presented frame's width and height.
+static SIZE: AtomicU64 = AtomicU64::new(0);
 
-/// At each present: the frame's time, and F3 (while one of our windows has
-/// the focus) shows or hides the panel. Whether it is shown.
-pub(crate) fn presented() -> bool {
+/// At each present of a `width` x `height` frame: the frame's time, and F3
+/// (while one of our windows has the focus) shows or hides the panel.
+/// Whether it is shown.
+pub(crate) fn presented(width: u32, height: u32) -> bool {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let on = std::env::var_os("VICTORY_OVERLAY").is_none_or(|v| v != "0");
         SHOWN.store(on, Ordering::Relaxed);
         tracing::info!(shown = on, "overlay (F3 shows or hides it)");
     });
+    SIZE.store(u64::from(width) << 32 | u64::from(height), Ordering::Relaxed);
     {
         let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -147,10 +212,49 @@ const YELLOW: u32 = 0x0040_D8FF;
 const GREEN: u32 = 0x0060_E060;
 const BACKGROUND: [u8; 4] = [18, 18, 18, 255];
 
+/// The process's processor time since the last call, in percent of one
+/// processor, and the seconds since the process started.
+fn processor() -> (f64, f64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    static LAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    let ticks = |t: FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
+    let [mut created, mut exited, mut kernel, mut user, mut now] = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 5];
+    // SAFETY: our own process and structures we own.
+    unsafe {
+        GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user);
+        GetSystemTimeAsFileTime(&mut now);
+    }
+    let (busy, now) = (ticks(kernel) + ticks(user), ticks(now));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let percent = if last.1 != 0 && now > last.1 {
+        100.0 * busy.saturating_sub(last.0) as f64 / (now - last.1) as f64
+    } else {
+        0.0
+    };
+    *last = (busy, now);
+    // FILETIME counts 100 ns.
+    (percent, now.saturating_sub(ticks(created)) as f64 / 1e7)
+}
+
 /// The panel's lines and their colours.
 fn lines(s: &Stats) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     let [count, total_ms, max_ms] = [0, 1, 2].map(|i| SLOW[i].load(Ordering::Relaxed));
+    static CARD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let card = CARD.get_or_init(|| crate::host::host().and_then(|h| h.card_name()).unwrap_or_default());
+    let size = SIZE.load(Ordering::Relaxed);
+    let (busy, up) = processor();
+    out.push((
+        WHITE,
+        format!(
+            "VIctory overlay (F3 hides)   {card}   {}x{}   up {up:.0} s   frame {}",
+            size >> 32,
+            size & 0xffff_ffff,
+            crate::frame::current()
+        ),
+    ));
     let fps_colour = if s.fps >= 25.0 {
         GREEN
     } else if s.fps >= 10.0 {
@@ -158,9 +262,36 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     } else {
         RED
     };
-    out.push((WHITE, "VIctory overlay   (F3 hides)".to_owned()));
     out.push((fps_colour, format!("{:5.1} fps   {:7.1} ms/frame", s.fps, s.ms)));
-    let parts = [("preparing", s.preparing), ("GPU", s.gpu), ("copying back", s.back_ms)];
+    {
+        let mut times: Vec<f32> = TIMES.lock().unwrap_or_else(|e| e.into_inner()).1.iter().copied().collect();
+        if !times.is_empty() {
+            times.sort_unstable_by(f32::total_cmp);
+            let median = times[times.len() / 2];
+            let p95 = times[times.len() * 95 / 100];
+            let worst = times[times.len() - 1];
+            let hitches = times.iter().filter(|&&ms| ms > 2.0 * median.max(1.0)).count();
+            out.push((
+                if hitches > 0 { YELLOW } else { GREY },
+                format!(
+                    "last {} frames: median {median:.0} ms, 95% under {p95:.0} ms, worst {worst:.0} ms, {hitches} over twice the median; \
+                     graph to {:.0} ms",
+                    times.len(),
+                    graph_top(median, worst)
+                ),
+            ));
+        }
+    }
+    // What holds the frame up: the submitting thread's work (preparing,
+    // waiting for the card, copying back) and the heap passes draws make
+    // in the title's recording threads (the title cannot submit a list
+    // before they end).
+    let parts = [
+        ("preparing (submitting thread)", s.preparing),
+        ("GPU", s.gpu),
+        ("copying back", s.back_ms),
+        ("heap passes in the title's recording threads", s.heap_pass_ms),
+    ];
     let (worst, worst_ms) = parts
         .iter()
         .copied()
@@ -173,6 +304,14 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
             s.preparing, s.copy_ms, s.copy_mb, s.texture_ms, s.texture_mb
         ),
     ));
+    let [all, other_thread, asking, still] = s.refresh;
+    out.push((
+        GREY,
+        format!(
+            "  texture refreshes, all threads {all:.1} ms: waiting for another thread's {other_thread:.1}, \
+             asking the write watch {asking:.1}, title memory to hold still {still:.1}"
+        ),
+    ));
     out.push((
         colour(s.gpu),
         format!(
@@ -182,41 +321,74 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     ));
     out.push((
         colour(s.back_ms),
-        format!("copying back {:7.1} ms  {:.1} MB", s.back_ms, s.back_mb),
+        format!(
+            "copying back {:7.1} ms  {:.1} MB; shader writes looked for on the CPU in {:.0} MB",
+            s.back_ms, s.back_mb, s.scanned_mb
+        ),
     ));
+    out.push((
+        colour(s.heap_pass_ms),
+        format!(
+            "heap passes  {:7.1} ms  in {:.0} passes, all recording threads (buffer views and textures picked by index)",
+            s.heap_pass_ms, s.heap_passes
+        ),
+    ));
+    let [flights, settles, settle_ms] = s.sent_ahead;
     out.push((
         GREY,
         format!(
-            "waiting for the card {:.1} ms, heap buffer passes {:.1} ms",
-            s.stood, s.heap_pass_ms
+            "waiting for the card {:.1} ms; sent ahead {flights:.0} in {settles:.1} settles ({settle_ms:.1} ms)",
+            s.stood
         ),
+    ));
+    // The submitting thread's busy time against the frame's: what is left
+    // is the title's (recording, its own work, our heap passes in it).
+    let ours = s.preparing + s.gpu + s.back_ms;
+    out.push((
+        GREY,
+        if ours < s.ms {
+            format!(
+                "submitting thread busy {ours:.0} of the frame's {:.0} ms; {:.0} ms waiting for the title to submit",
+                s.ms,
+                s.ms - ours
+            )
+        } else {
+            format!("submitting thread busy all the frame's {:.0} ms ({ours:.0} ms of work, some of it overlapping)", s.ms)
+        },
     ));
     if !worst.is_empty() {
         out.push((
             RED,
             format!(
-                "bottleneck: {worst} ({:.0}% of the frame)",
+                "bottleneck: {worst}, {worst_ms:.0} ms ({:.0}% of the frame's time)",
                 100.0 * worst_ms / s.ms.max(1.0)
             ),
         ));
     }
+    let processors = std::thread::available_parallelism().map_or(1, usize::from);
+    out.push((
+        if busy >= 90.0 * processors as f64 { RED } else { WHITE },
+        format!("processor: {busy:.0}% of one ({processors} in all)"),
+    ));
     let dropped_colour = if s.dropped >= 1.0 { YELLOW } else { WHITE };
     out.push((
         dropped_colour,
         format!(
-            "draws {:.0}   dropped {:.0}   indirect {:.0}",
-            s.draws, s.dropped, s.indirect
+            "draws {:.0}   dropped {:.0}   indirect {:.0}   mesh groups {:.0}",
+            s.draws, s.dropped, s.indirect, s.mesh_groups
         ),
     ));
-    for (why, n) in s.drops.iter().take(4) {
-        let why: String = why.chars().take(58).collect();
+    for (why, n) in s.drops.iter().take(5) {
+        let why: String = why.chars().take(72).collect();
         out.push((GREY, format!("  {n:6.1}  {why}")));
     }
     out.push((
         if s.making > 0 { YELLOW } else { WHITE },
         format!(
-            "pipelines being made {}   slow compiles {} ({:.0} s, slowest {:.1} s)",
+            "pipelines: {} being made, {} made, {} from the library; slow compiles {} ({:.0} s, slowest {:.1} s)",
             s.making,
+            crate::pipeline::library::MADE.load(Ordering::Relaxed),
+            crate::pipeline::library::LOADED.load(Ordering::Relaxed),
             count,
             total_ms as f64 / 1000.0,
             max_ms as f64 / 1000.0
@@ -224,33 +396,54 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     ));
     if count > 0 {
         let last = LAST_SLOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let last: String = last.chars().take(60).collect();
+        let last: String = last.chars().take(72).collect();
         out.push((GREY, format!("  last slow: {last}")));
     }
     let waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
     out.push((
         if waiting > 0 { YELLOW } else { WHITE },
         format!(
-            "textures by index: {} uploaded, {} waiting, {} passed over unmapped",
+            "textures by index: {} uploaded ({} MB), {} waiting, {} passed over unmapped",
             crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+            crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
             waiting,
             crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed)
         ),
     ));
-    let gb = |b: u64| b as f64 / f64::from(1u32 << 30);
-    let video = crate::host::host().and_then(|h| h.video_memory());
+    let [queued, due, away, partly, oldest] =
+        [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+    out.push((
+        GREY,
+        format!(
+            "  queue: {queued} slots, {due} due (the oldest {oldest} frames), {away} waiting for their memory, {partly} uploaded in part"
+        ),
+    ));
+    let [copies, joined] = s.copies;
     out.push((
         WHITE,
-        match video {
-            Some([budget, used, ..]) => format!(
-                "memory: process {:.1} GB, video {:.1} of {:.1} GB",
+        format!(
+            "title buffer copies {copies:.0} ({joined:.0} continue the one before); {:.1} depth twin copies",
+            s.twin_copies
+        ),
+    ));
+    if crate::shadow::cards() {
+        out.push((GREY, format!("  copies in the card's memory: {:.1} MB sent up", s.card_sent_mb)));
+    }
+    let gb = |b: u64| b as f64 / f64::from(1u32 << 30);
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    out.push(match video {
+        Some([budget, used, _, shared]) => (
+            if used > budget || shared > 1 << 30 { RED } else { WHITE },
+            format!(
+                "memory: process {:.1} GB; video {:.1} of {:.1} GB, and {:.1} GB of the PC's shared",
                 gb(private_bytes()),
                 gb(used),
-                gb(budget)
+                gb(budget),
+                gb(shared)
             ),
-            None => format!("memory: process {:.1} GB", gb(private_bytes())),
-        },
-    ));
+        ),
+        None => (WHITE, format!("memory: process {:.1} GB", gb(private_bytes()))),
+    });
     out
 }
 
@@ -391,14 +584,15 @@ pub(crate) fn record(
     (width, height, format): (u32, u32, DXGI_FORMAT),
 ) {
     let Some(bpp) = bytes_per_pixel(format) else { return };
-    let Some((version, stats)) = STATS.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+    let (version, lines) = LINES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if version == 0 {
         return;
-    };
-    // The text: once per figures, a line a 54th of the frame's height.
-    let line = (height / 54).clamp(14, 40);
+    }
+    // The text: once per figures, a line a 64th of the frame's height.
+    let line = (height / 64).clamp(12, 34);
     let mut text = TEXT.lock().unwrap_or_else(|e| e.into_inner());
     if text.as_ref().is_none_or(|t| t.version != version || t.line != line) {
-        let drawn = draw_text(&lines(&stats), line, version);
+        let drawn = draw_text(&lines, line, version);
         if drawn.is_none() {
             tracing::warn!("overlay text not drawn");
             return;
@@ -431,28 +625,31 @@ pub(crate) fn record(
         }
         p.text_version = text.version;
     }
-    // The graph: a bar per frame, newest at the right; the top is the
-    // slowest frame shown (at least 100 ms); a line at 33.3 ms (30 fps).
+    // The graph: a bar per frame, newest at the right; the top is
+    // [`graph_top`] (taller frames reach it in a lighter red); a line at
+    // 33.3 ms (30 fps).
     let rows = h - text_rows;
     if rows > 0 {
         let times = TIMES.lock().unwrap_or_else(|e| e.into_inner()).1.clone();
-        let top = times.iter().copied().fold(100.0f32, f32::max);
-        let bar = (w / HISTORY as u32).max(2);
-        let shown = (w / bar) as usize;
-        let skip = times.len().saturating_sub(shown);
+        let mut sorted: Vec<f32> = times.iter().copied().collect();
+        sorted.sort_unstable_by(f32::total_cmp);
+        let top = sorted.last().map_or(100.0, |&worst| graph_top(sorted[sorted.len() / 2], worst));
+        let bar = w.div_ceil(HISTORY as u32).max(2);
         let at_30 = rows - ((33.3 / top) * rows as f32) as u32;
         for y in 0..rows {
             let row = &mut pixels[((text_rows + y) * pitch) as usize..][..(w * bpp) as usize];
             for x in 0..w {
-                let i = (x / bar) as usize;
-                let colour = match times.get(skip + i) {
-                    Some(&ms) if y >= rows - ((ms / top) * rows as f32) as u32 => {
+                let from_right = ((w - 1 - x) / bar) as usize;
+                let colour = match times.len().checked_sub(1 + from_right).and_then(|i| times.get(i)) {
+                    Some(&ms) if y >= rows - ((ms.min(top) / top) * rows as f32) as u32 => {
                         if ms <= 34.0 {
                             [96, 224, 96, 255]
                         } else if ms <= 100.0 {
                             [64, 216, 255, 255]
-                        } else {
+                        } else if ms <= top {
                             [76, 76, 255, 255]
+                        } else {
+                            [160, 160, 255, 255]
                         }
                     }
                     _ if y == at_30 => [80, 80, 80, 255],
@@ -481,6 +678,13 @@ pub(crate) fn record(
     unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| tracing::info!(width = w, height = h, format = format.0, "overlay drawn"));
+}
+
+/// The frame-time graph's top: the slowest frame, but no more than four
+/// times the median (one stall of seconds would flatten the rest), and at
+/// least 100 ms.
+fn graph_top(median: f32, worst: f32) -> f32 {
+    worst.min(4.0 * median).max(100.0)
 }
 
 /// An upload buffer for a `w` x `h` panel of `format`, mapped.

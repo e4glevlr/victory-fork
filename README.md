@@ -201,15 +201,24 @@ info and above).
 ## Debugging
 
 Every build has an on-screen panel of where the frame goes, shown from the
-start: F3 hides or shows it (`VICTORY_OVERLAY=0` starts with it hidden). Once a second it
-shows frames per second and ms per frame; preparing (title memory copies,
-texture refreshes), GPU and copy-back ms with the largest named the
-bottleneck; how busy the card was and how long it stood idle behind us;
-draws, draws dropped (and why, in a diagnostics build), pipelines being made
-and the driver's slow compiles; textures picked by index still waiting;
-process and video memory; and a bar per frame for the last frames' times
-(green to 34 ms, yellow to 100 ms, red above; a grey line at 33 ms). It is
-copied onto the window's image, not into saved frames.
+start: F3 hides or shows it (`VICTORY_OVERLAY=0` starts with it hidden).
+Once a second it shows the card, window size, uptime and frame; frames per
+second, ms per frame and the last 240 frames' median, 95th percentile,
+worst and hitches; our costs per frame with the largest named the
+bottleneck: preparing on the submitting thread (title memory copies,
+texture refreshes and what they waited for), GPU (how busy the card was,
+how long it stood idle behind us), copy-back, and the heap passes draws make
+in the title's recording threads; how much of the
+frame the submitting thread waited for the title; the processor time the
+process takes; draws, draws dropped (and why, in a diagnostics
+build); pipelines being made, made and loaded, and the driver's slow
+compiles; textures picked by index and their queue; title buffer copies;
+process, video and shared memory; and a bar per frame for the last frames'
+times (green to 34 ms, yellow to 100 ms, red above; a grey line at 33 ms).
+It is copied onto the window's image, not into saved frames. Each second's
+panel is also appended, shown or hidden, to `overlay.log` in the cache
+folder (`VICTORY_OVERLAY_LOG=<file>` elsewhere, `0` not at all;
+`scripts/bench.ps1` puts it in the run's folder).
 
 A release build has no other debugging aids. Build them in with
 
