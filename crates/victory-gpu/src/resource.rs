@@ -1888,13 +1888,90 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
+/// Whether idle / unmapped host texture eviction is enabled
+/// (`VICTORY_TEXTURE_SWEEP=0` disables it).
+#[cfg(windows)]
+fn sweeping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
+/// Whether two half-open address ranges `[a_start, a_start + a_len)` and
+/// `[b_start, b_start + b_len)` overlap.
+pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
+    }
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// Lets go of the host copies of placed textures the title fills whose
+/// backing overlaps `[base, base + len)` immediately when title memory is
+/// unmapped or moved (`crate::watch::title_memory_remapped`).
+#[cfg(windows)]
+pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !sweeping() || len == 0 {
+        return 0;
+    }
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let size = footprint(&r.desc).map_or(0, |f| f.size);
+        if !ranges_overlap(r.data() as u64, size, base, len) {
+            continue;
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let only_here = made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if only_here {
+                // Under the lock: the next use must not find the staging
+                // state of the texture let go (it says "uploaded").
+                crate::texture::unstage(at as This);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            went += 1;
+            bytes += host.bytes;
+            if first.is_none() {
+                first = Some(at);
+            }
+            crate::host::retire(host);
+        }
+    }
+    if went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "unmapped: {went} host copies of placed textures let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                bytes >> 10,
+                first.unwrap_or(0)
+            )
+        });
+    }
+    went
+}
+
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !sweeping() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
@@ -2754,6 +2831,16 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
+}
+
+/// Like [`texture_at`], ensuring `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`
+/// (`0x4`) is set so placed 2D/3D UAV texture views get a writable host resource.
+#[cfg(windows)]
+pub(crate) fn unordered_texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    const ALLOW_UNORDERED_ACCESS: u32 = 0x4;
+    let mut with_uav = *desc;
+    with_uav[12] |= ALLOW_UNORDERED_ACCESS;
+    texture_at(address, &with_uav)
 }
 
 /// The resource for a texture placed at `address` with the resource
@@ -4399,5 +4486,17 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn ranges_overlap_checks_half_open_and_empty_bounds() {
+        assert!(!ranges_overlap(0x1000, 0, 0x1000, 0x1000));
+        assert!(!ranges_overlap(0x1000, 0x1000, 0x1000, 0));
+        assert!(!ranges_overlap(0x1000, 0x1000, 0x2000, 0x1000));
+        assert!(!ranges_overlap(0x2000, 0x1000, 0x1000, 0x1000));
+        assert!(ranges_overlap(0x1000, 0x1000, 0x1800, 0x1000));
+        assert!(ranges_overlap(u64::MAX - 0x100, 0x1000, u64::MAX - 0x10, 0x10));
+        #[cfg(windows)]
+        assert_eq!(evict_placed_in(0x1000, 0), 0);
     }
 }
