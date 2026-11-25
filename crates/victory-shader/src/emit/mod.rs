@@ -107,6 +107,7 @@ mod sampler_choice_tests;
 mod semantics_tests;
 mod shader;
 mod threading;
+mod trip;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -173,8 +174,9 @@ pub fn emit_with(
 /// are used.
 pub const PIPELINE_STACK: usize = 256 << 20;
 
-/// The iteration counts after which a translated loop is left, per lane
-/// and per entry into the loop, by stage.
+/// The iteration counts after which a translated loop whose end the data
+/// decides is left, per lane and per entry into the loop, by stage (a loop
+/// whose code fixes its count runs to its end: `trip`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopLimits {
     pub pixel: u32,
