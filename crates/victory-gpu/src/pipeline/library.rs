@@ -441,6 +441,15 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            // PIX's capturer wraps the device: the runtime rejects a library
+            // saved without it, and what it saves is not a library of ours
+            // (one PIX run replaced a 426 MB library with 848 bytes, and the
+            // next run made every pipeline again). No library under PIX.
+            #[cfg(feature = "diagnostics")]
+            if crate::pix::loaded() {
+                tracing::warn!("VICTORY_PIX: no host pipeline library this run (every pipeline is made; the saved one is left as it is)");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);

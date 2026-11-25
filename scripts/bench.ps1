@@ -530,7 +530,8 @@ try {
 $facts = @{
     label           = $Label
     switches        = $Switches
-    commit          = (git -C $root rev-parse --short HEAD 2>$null)
+    # A build given with -Victory need not be the tree's: named by file.
+    commit          = if ($Victory) { 'build ' + (Split-Path -Leaf $victory) + ' of ' + (Get-Item $victory).LastWriteTime.ToString('yyyy-MM-dd HH:mm') } else { (git -C $root rev-parse --short HEAD 2>$null) }
     gpu             = (Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join '; '
     exit            = $exit
     peak_private_gb = [math]::Round($peak / 1GB, 1)

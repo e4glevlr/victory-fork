@@ -74,6 +74,11 @@ pub(crate) fn load() {
     });
 }
 
+/// Whether the capturer is loaded (the host device is PIX's then).
+pub(crate) fn loaded() -> bool {
+    matches!(PIX.get(), Some(Some(_)))
+}
+
 /// `%ProgramFiles%\Microsoft PIX\<newest version>\WinPixGpuCapturer.dll`
 /// (versions are dated folder names: the greatest name is the newest).
 fn newest_capturer() -> Option<PathBuf> {
