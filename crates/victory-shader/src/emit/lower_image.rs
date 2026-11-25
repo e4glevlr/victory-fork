@@ -57,7 +57,7 @@ impl Lower<'_> {
         let addr_u32 = |l: &mut Self, reg_idx: usize| -> Result<V, Why> {
             let r = *regs.get(reg_idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
         let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {

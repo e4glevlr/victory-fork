@@ -62,6 +62,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/link.rs"),
         include_str!("emit/lower.rs"),
         include_str!("emit/loops.rs"),
+        include_str!("emit/guarded.rs"),
         include_str!("emit/forms.rs"),
         include_str!("emit/regions.rs"),
         include_str!("emit/lower_image.rs"),
