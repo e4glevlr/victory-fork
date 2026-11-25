@@ -216,7 +216,7 @@ fn lower_wave(
         }),
         code,
     };
-    let p = ir::build(&native.code, wave64, 256).unwrap();
+    let p = crate::spill::build(&native).unwrap();
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native).unwrap();
@@ -351,6 +351,47 @@ fn the_24_bit_multiplies_lower_both_halves() {
         let word = op << 25 | 2 << 9 | 0x101;
         lowers_valu(&[word]).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
     }
+}
+
+/// A register array indexed through M0 (v8-v11) below VGPRs that hold descriptor words
+/// (v12-v15), which have no host value: clamped (`v_med3_u32`, `v_and_b32`), the moves
+/// reach only the array and the program lowers; unclamped, the read could reach the
+/// descriptor words and the program is refused.
+#[test]
+fn relative_moves_reach_only_what_their_clamped_index_can() {
+    let body = |second_index: u32| {
+        let mut w = Vec::new();
+        for k in 0..4u32 {
+            w.push(0x7E00_0200 | (8 + k) << 17 | (138 + k)); // v_mov_b32 v8+k, 10+k
+            w.push(0x7E00_0200 | (12 + k) << 17 | (8 + k)); // v_mov_b32 v12+k, s8+k
+        }
+        w.extend([
+            0xD559_0005, // v_med3_u32 v5, v1, 0, 3
+            0x020D_0101,
+            0x7E18_0505,  // v_readfirstlane_b32 s12, v5
+            0xBEFC_030C,  // s_mov_b32 m0, s12
+            0x7E10_8503,  // v_movreld_b32 v8, v3: v[8 + m0] = v3
+            second_index, // v6 = the second index
+            0x7E18_0506,  // v_readfirstlane_b32 s12, v6
+            0xBEFC_030C,  // s_mov_b32 m0, s12
+            0x7E00_8708,  // v_movrels_b32 v0, v8: v0 = v[8 + m0]
+        ]);
+        w
+    };
+    // v_and_b32 v6, 3, v2
+    lowers_valu(&body(0x360C_0483)).unwrap();
+    // v_mov_b32 v6, v2
+    let refused = lowers_valu(&body(0x7E0C_0302));
+    assert!(
+        matches!(
+            refused,
+            Err(crate::ShaderError::Unsupported {
+                what: "a descriptor's address or format read as data",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
 }
 
 #[test]
