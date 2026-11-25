@@ -2096,15 +2096,6 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
         h = (h ^ part[i]) * mul;
         h = h.yzwx ^ (h >> 15);
     }
-    lanes[lane] = h;
-    GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint width = 128u; width > 0u; width >>= 1) {
-        if (lane < width) lanes[lane] = mix(lanes[lane], lanes[lane + width]);
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (lane != 0u) return;
-    h = lanes[0];
     if (compare != 0u) {
         differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
