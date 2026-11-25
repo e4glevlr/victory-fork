@@ -116,6 +116,8 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const NO_REFACTORING: u64 = 1 << 1;
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
