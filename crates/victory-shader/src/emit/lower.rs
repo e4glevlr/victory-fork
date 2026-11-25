@@ -3529,7 +3529,7 @@ impl<'a> Lower<'a> {
     fn memory_smem(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
-            base: Operand::Scalar { code: base, .. },
+            base: Some(Operand::Scalar { code: base, .. }),
             offset,
             soffset,
             ..
@@ -7218,7 +7218,7 @@ impl<'a> Lower<'a> {
         else {
             return Err("a descriptor load");
         };
-        let Operand::Scalar { code, .. } = *base else {
+        let Some(Operand::Scalar { code, .. }) = *base else {
             return Err("a descriptor load");
         };
         let c = self.cur;
