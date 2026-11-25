@@ -93,6 +93,9 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// How a console wave64 compute program was run on a host of 32-lane waves
+    /// ([`super::forms`]), empty otherwise.
+    pub form: &'static str,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -2748,8 +2751,18 @@ impl<'a> Lower<'a> {
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.sampler_cmp.clone();
         let wave_size = self.s.wave_size;
+        let form = match () {
+            _ if self.twin.is_some() => super::forms::PAIRED,
+            _ if self.local && self.local_any => super::forms::LOCAL_ANY,
+            _ if self.local => super::forms::LOCAL,
+            _ if self.exchange.is_some() => super::forms::EXCHANGE,
+            _ if self.halves.is_some() => super::forms::HALVES,
+            _ if self.x.native.wave64 && wave_size == Some(64) => super::forms::WAVE64,
+            _ => "",
+        };
         Ok(Lowered {
             wave_size,
+            form,
             cmp_samplers,
             root_cbvs,
             root_srvs,
