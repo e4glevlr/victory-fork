@@ -1143,7 +1143,7 @@ void main() {
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
-                ahead,
+                if ahead { AHEAD } else { 0 },
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
