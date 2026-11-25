@@ -1288,6 +1288,11 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// With [`fill_on_card`]: a device-local buffer constant buffer views of
+    /// the list read, filled by copies on the card ([`HostList::card_constants`]):
+    /// the buffer, the bytes used, and whether it is in the constant buffer
+    /// state (it decays to the common state when a submission has run).
+    card_constants: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -3146,6 +3151,21 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+/// Whether title memory `[from, to)` lies in what flights in the air may
+/// write (with [`late`]).
+pub(crate) fn flights_write(from: usize, to: usize) -> bool {
+    touches(&line().written, from, to)
+}
+
+/// Whether a constant buffer view of a table whose title memory flights may
+/// write is filled on the card, behind them ([`HostList::card_constants`]),
+/// instead of in upload memory at submission, which waits for them to land
+/// (`VICTORY_FILL_ON_CARD=1`; off by default).
+pub(crate) fn fill_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ON_CARD").is_some_and(|v| v == "1"))
+}
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -3238,7 +3258,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3256,7 +3276,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3307,10 +3327,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// in the air is about to change takes the old bytes, and the lists of
 /// that one submission draw with them. `wrote` sees it when the flight
 /// lands (the bytes going into title memory are compared with the ones
-/// there, over every fill that read ahead of them) and from then on fills
-/// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+/// the fill read, over every fill that read ahead of them) and from then
+/// on fills that read the 64 KiB pieces where that happened wait as before;
+/// after `HELD_MAX` such pieces, every fill waits again.
+/// `VICTORY_FILL_WAIT=1`: they wait from the start.
+///
+/// A fill is only taken for missed when title memory still holds what the
+/// fill read (its fingerprint at the fill): bytes the title rewrote after
+/// the fill say nothing about what the fill saw, and comparing with them
+/// used to turn the waiting back on for good on the first such rewrite (one
+/// settle of about 100 ms a frame for the rest of the run).
 mod fill_ahead {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::{Mutex, OnceLock};
 
@@ -3320,13 +3348,26 @@ mod fill_ahead {
     /// it at most (flights are settled at 256 lists in the air, and by
     /// every present that waits).
     const KEEP: u64 = 16;
+    /// Pieces held back (fills reading them wait) before all fills wait.
+    const HELD_MAX: usize = 8;
 
-    /// A flight changed bytes a fill had read ahead of it: fills wait.
+    /// More than `HELD_MAX` pieces had a miss: every fill waits.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// Whether `HELD` has any piece (a cheap look before the lock).
+    static ANY_HELD: AtomicBool = AtomicBool::new(false);
+    /// The pieces where a flight changed bytes a fill had read ahead of
+    /// it: fills that read them wait.
+    static HELD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
-    /// flight then changed.
-    static COUNT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// flight then changed; fills not compared because the title had
+    /// rewritten their bytes since.
+    static COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    /// The fingerprint of the title memory a fill reads.
+    fn print(src: usize, len: usize) -> u64 {
+        crate::texture::fingerprint(src as u64, len as u64)
+    }
 
     #[derive(Default)]
     struct Piece {
@@ -3334,8 +3375,9 @@ mod fill_ahead {
         pruned: u64,
         /// From, to, frame, and the number of the last submission started
         /// when it read: the flights in the air then have that number or
-        /// a lower one, and only their writes can be ones it missed.
-        fills: Vec<(usize, usize, u64, u64)>,
+        /// a lower one, and only their writes can be ones it missed; and
+        /// the fingerprint of the bytes it read.
+        fills: Vec<(usize, usize, u64, u64, u64)>,
     }
 
     /// The lowest submission number among the flights the landing thread
@@ -3351,9 +3393,36 @@ mod fill_ahead {
 
     static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
 
-    pub(super) fn on() -> bool {
+    /// Whether a fill of `len` bytes at `src` may read ahead of flights.
+    pub(super) fn on(src: usize, len: usize) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) || WAIT.load(Relaxed) {
+            return false;
+        }
+        if len == 0 || !ANY_HELD.load(Relaxed) {
+            return true;
+        }
+        let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(held) = held.as_ref() else { return true };
+        !(src / PIECE..=(src + len - 1) / PIECE).any(|piece| held.contains(&piece))
+    }
+
+    /// Fills that read `[from, to)` wait from now on (or every fill, past
+    /// `HELD_MAX` pieces). True the first time anything is held.
+    fn hold(from: usize, to: usize) -> bool {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let held = held.get_or_insert_with(HashSet::new);
+        let first = held.is_empty();
+        held.extend(from / PIECE..=(to - 1) / PIECE);
+        ANY_HELD.store(true, Relaxed);
+        if held.len() > HELD_MAX && !WAIT.swap(true, Relaxed) {
+            tracing::warn!(
+                "fills of upload memory read ahead of flights that changed their bytes in {} pieces of 64 KiB: every fill \
+                 waits for flights again from here on, as with VICTORY_FILL_WAIT=1",
+                held.len()
+            );
+        }
+        first
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3364,6 +3433,7 @@ mod fill_ahead {
         }
         COUNT[0].fetch_add(1, Relaxed);
         let frame = crate::frame::current();
+        let print = print(src, len);
         let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
         let map = read.get_or_insert_with(HashMap::new);
         for piece in src / PIECE..=(src + len - 1) / PIECE {
@@ -3372,7 +3442,7 @@ mod fill_ahead {
                 p.pruned = frame;
                 p.fills.retain(|f| f.2 + KEEP >= frame);
             }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed)));
+            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed), print));
         }
     }
 
@@ -3384,7 +3454,7 @@ mod fill_ahead {
         }
         let frame = crate::frame::current();
         let landing = LANDING.load(Relaxed);
-        let hits: Vec<(usize, usize, u64)> = {
+        let mut hits: Vec<(usize, usize, u64, u64)> = {
             let read = READ.lock().unwrap_or_else(|e| e.into_inner());
             let Some(map) = read.as_ref() else { return };
             let end = at + new.len();
@@ -3392,35 +3462,45 @@ mod fill_ahead {
                 .filter_map(|piece| map.get(&piece))
                 .flat_map(|p| p.fills.iter().copied())
                 .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
-                .map(|f| (f.0, f.1, f.2))
+                .map(|f| (f.0, f.1, f.2, f.4))
                 .collect()
         };
         if hits.is_empty() {
             return;
         }
+        // A fill that spans pieces is kept in each of them.
+        hits.sort_unstable();
+        hits.dedup();
         COUNT[1].fetch_add(1, Relaxed);
         let mut now = Vec::new();
-        for (from, to, read_in) in hits {
+        for (from, to, read_in, print_then) in hits {
+            // The title rewrote the bytes since the fill (or a landing before
+            // this one did, and was compared then): what is there now is not
+            // what the fill read, so it cannot tell a miss.
+            if print(from, to - from) != print_then {
+                COUNT[3].fetch_add(1, Relaxed);
+                continue;
+            }
             let (a, b) = (from.max(at), to.min(at + new.len()));
             now.clear();
             now.resize(b - a, 0);
-            // Title memory as it is, which is what the fill read unless the
-            // title wrote it since; not there: nothing to say.
+            // Title memory as it is: what the fill read. Not there: nothing
+            // to say.
             if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
                 continue;
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
-            if !WAIT.swap(true, Relaxed) {
+            if hold(from, to) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
                      them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
-                     Fills wait for flights again from here on, as with VICTORY_FILL_WAIT=1 ({n} such fills)",
+                     Fills that read its 64 KiB wait for flights from here on; past {HELD_MAX} such pieces, every fill does \
+                     ({n} such fills)",
                     to - from,
                     a + first
                 );
             }
-            return;
         }
     }
 
@@ -3444,12 +3524,64 @@ mod fill_ahead {
         tracing::info!(
             "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=1 waits): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
-             bytes a flight then changed, since the start: {}{}; {kept} fills kept to check",
+             bytes a flight then changed, since the start: {} ({} pieces of 64 KiB held back{}); fills not compared because the \
+             title had rewritten their bytes since: {}; {kept} fills kept to check",
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
-            if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
+            HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashSet::len),
+            if WAIT.load(Relaxed) { ", every fill waits again" } else { "" },
+            COUNT[3].load(Relaxed)
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn held(at: usize) -> bool {
+            HELD.lock().unwrap().as_ref().is_some_and(|h| h.contains(&(at / PIECE)))
+        }
+
+        /// One test: the module's state is shared by the whole process.
+        #[test]
+        fn only_real_misses_hold_fills_back() {
+            const LEN: usize = 480;
+            // Three pieces of 64 KiB of their own, one per case.
+            let mut memory = vec![0u8; 4 * PIECE];
+            let start = memory.as_ptr() as usize;
+            let base = start.next_multiple_of(PIECE) - start;
+            let at = |i: usize| start + base + i * PIECE;
+            let (rewritten, missed, same) = (at(0), at(1), at(2));
+            for i in 0..3 {
+                memory[base + i * PIECE..][..LEN].fill(1);
+            }
+
+            // The title rewrites the bytes after the fill, then a flight's
+            // shaders land other bytes there: the fill read the 1s, nothing
+            // can be said, and nothing is held back (this used to turn
+            // waiting on for good).
+            read(rewritten, LEN);
+            memory[base..][..LEN].fill(2);
+            wrote(rewritten, &[3; LEN]);
+            assert!(!held(rewritten), "a rewrite by the title is not a miss");
+            assert!(on(rewritten, LEN));
+
+            // Nothing rewrote them and the shaders changed them: a miss;
+            // fills of that piece wait, fills elsewhere do not.
+            read(missed, LEN);
+            wrote(missed, &[3; LEN]);
+            assert!(held(missed), "a real miss holds its piece back");
+            assert!(!on(missed, LEN));
+            assert!(on(same, LEN));
+            assert!(!WAIT.load(Relaxed), "one piece does not make every fill wait");
+
+            // The shaders wrote what was there already: no miss.
+            read(same, LEN);
+            wrote(same, &[1; LEN]);
+            assert!(!held(same));
+            assert!(on(same, LEN));
+        }
     }
 }
 
@@ -4719,6 +4851,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                card_constants: Mutex::default(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
@@ -7119,6 +7252,11 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(c) = self.card_constants.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            // Every submission of the list has run: the buffer is free, and
+            // in the common state again.
+            (c.1, c.2) = (0, false);
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -7596,6 +7734,57 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+    }
+
+    /// With [`fill_on_card`]: `len` bytes of the host copy `shadow` from title
+    /// address `address`, copied on the card where the list stands into its
+    /// device-local constants buffer: the GPU address of the bytes there (on
+    /// 256 bytes, for a constant buffer view), or `None` (no buffer, no room).
+    ///
+    /// A fill of upload memory reads title memory on the CPU at submission,
+    /// and a submission whose fill reads what a flight's shaders write waits
+    /// for the flight to land (52-80 ms a frame in the world, one table
+    /// constant buffer of 512 bytes). Read on the card, behind the flight on
+    /// the same queue, those bytes are what the shaders wrote without the
+    /// wait; title writes to them reach the copy first, through its refresh.
+    pub(crate) fn card_constants(&self, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> Option<u64> {
+        const SIZE: u64 = 1 << 20;
+        let host = host()?;
+        let offset = shadow.offset_in(address)?;
+        if len == 0 || shadow.left(address) < len {
+            return None;
+        }
+        let room = len.next_multiple_of(256);
+        let mut c = self.card_constants.lock().unwrap_or_else(|e| e.into_inner());
+        if c.is_none() {
+            let buffer = host.uav_buffer(SIZE)?;
+            name(&buffer, || "list constants on the card".into());
+            *c = Some((buffer, 0, false));
+        }
+        let (buffer, used, readable) = c.as_mut()?;
+        let buffer: &ID3D12Resource = buffer;
+        if *used + room > SIZE {
+            return None;
+        }
+        let at = *used;
+        *used += room;
+        let constants = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        // SAFETY: an open list; both buffers are live and the ranges inside
+        // them (checked above).
+        unsafe {
+            if *readable {
+                self.list.ResourceBarrier(&[transition(buffer, constants, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            // What shaders of this list wrote to the copy before, first.
+            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            }]);
+            self.list.CopyBufferRegion(buffer, at, &shadow.buffer, offset, len);
+            self.list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COPY_DEST, constants)]);
+            *readable = true;
+            Some(buffer.GetGPUVirtualAddress() + at)
+        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -10700,5 +10889,98 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod fill_on_card_tests {
+    use super::*;
+
+    /// A readback buffer of `len` bytes.
+    fn readback(host: &Host, len: u64) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+                .unwrap();
+        }
+        buffer.unwrap()
+    }
+
+    /// What a flight's shaders wrote to a host copy (bytes the title's memory
+    /// does not have) reaches constants filled on the card, byte for byte,
+    /// for two fills in one list.
+    #[test]
+    fn constants_filled_on_the_card_read_what_the_card_wrote() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const LEN: usize = 1 << 16;
+        // Title memory: a buffer the title fills with 0xAA.
+        let title: &'static mut [u8] = Box::leak(vec![0xAAu8; LEN].into_boxed_slice());
+        let start = title.as_ptr() as u64;
+        let resource = 0x7e57_0001usize;
+        crate::shadow::register(resource, start, LEN as u64);
+        let shadow = crate::shadow::find(start + 64, 512).expect("a host copy");
+        let offset = shadow.offset_in(start).expect("the copy starts at the buffer");
+        // A "flight" writes a pattern into the copy on the card.
+        let pattern: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        // SAFETY: the upload buffer holds 1024 mapped bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
+        let flight = host.new_list().unwrap();
+        // SAFETY: an open list; live buffers, ranges inside them.
+        unsafe { flight.list.CopyBufferRegion(&shadow.buffer, offset + 64, &upload, 0, 1024) };
+        flight.close();
+        host.execute(&[&flight]);
+        // The next list fills two constant buffers from it on the card.
+        let list = host.new_list().unwrap();
+        let first = list.card_constants(&shadow, start + 64, 512).expect("room");
+        let second = list.card_constants(&shadow, start + 64 + 512, 300).expect("room");
+        assert!(first.is_multiple_of(256));
+        assert!(second.is_multiple_of(256));
+        let constants = list.card_constants.lock().unwrap().as_ref().unwrap().0.clone();
+        // SAFETY: a live buffer.
+        let base = unsafe { constants.GetGPUVirtualAddress() };
+        let back = readback(host, 1024);
+        // SAFETY: an open list; the constants buffer is in the constant
+        // buffer state after the fills; ranges inside both buffers.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &constants,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&back, 0, &constants, first - base, 512);
+            list.list.CopyBufferRegion(&back, 512, &constants, second - base, 300);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); 1024 bytes.
+        let read = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024).to_vec()
+        };
+        assert_eq!(read[..512], pattern[..512], "the first fill");
+        assert_eq!(read[512..812], pattern[512..812], "the second fill");
+        // The title's memory was never read: it still holds 0xAA.
+        assert!(title[64..1088].iter().all(|&b| b == 0xAA));
+        crate::shadow::unregister(resource, start);
     }
 }
