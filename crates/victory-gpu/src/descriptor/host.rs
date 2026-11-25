@@ -580,6 +580,9 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -587,20 +590,50 @@ impl TextureQueue {
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
+        let mut newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // At most `max` entries can survive the final truncation. Partition
+        // before sorting so a large backlog does not sort every due slot.
+        if again.len() > max {
+            again.select_nth_unstable_by(max, &mut newest_first);
+            again.truncate(max);
+        }
+        again.sort_unstable_by(&mut newest_first);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let remaining = max - order.len();
+        if fresh.len() <= remaining {
+            fresh.sort_unstable_by(&mut newest_first);
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old {
+                order.push((fresh[new].1, fresh[new].2));
+                new += 1;
+                if new < old {
+                    old -= 1;
+                    order.push((fresh[old].1, fresh[old].2));
+                }
+            }
+        } else if remaining > 0 {
+            // Fresh slots alternate newest and oldest. Select just those two
+            // ends; the middle of a large backlog is not returned this pass.
+            let newest_count = remaining.div_ceil(2);
+            let oldest_count = remaining / 2;
+            fresh.select_nth_unstable_by(newest_count, &mut newest_first);
+            let mut oldest = fresh.split_off(newest_count);
+            if oldest_count > 0 {
+                let middle = oldest.len() - oldest_count;
+                oldest.select_nth_unstable_by(middle, &mut newest_first);
+                oldest.drain(..middle);
+                oldest.sort_unstable_by(|a, b| newest_first(b, a));
+            } else {
+                oldest.clear();
+            }
+            fresh.sort_unstable_by(&mut newest_first);
+            for index in 0..newest_count {
+                order.push((fresh[index].1, fresh[index].2));
+                if index < oldest_count {
+                    order.push((oldest[index].1, oldest[index].2));
+                }
             }
         }
-        order.truncate(max);
         order
     }
 
@@ -3543,6 +3576,53 @@ mod tests {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    fn due_by_full_sort(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
+        for (&index, w) in q.slots.iter().filter(|(_, w)| w.due <= frame) {
+            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            class.push((w.written, index, w.write));
+        }
+        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        again.sort_unstable_by(newest_first);
+        fresh.sort_unstable_by(newest_first);
+        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old && order.len() < max {
+            order.push((fresh[new].1, fresh[new].2));
+            new += 1;
+            if new < old && order.len() < max {
+                old -= 1;
+                order.push((fresh[old].1, fresh[old].2));
+            }
+        }
+        order.truncate(max);
+        order
+    }
+
+    #[test]
+    fn partial_due_selection_matches_full_sort_for_large_backlogs() {
+        let mut q = TextureQueue::default();
+        for index in 0..8192u32 {
+            q.slots.insert(
+                index,
+                Waiting {
+                    due: u64::from(index % 11),
+                    written: u64::from(index % 97),
+                    write: u64::from(index) * 3 + 1,
+                    looks: u8::from(index % 3 == 0),
+                    mapped: u64::from(index % 5 == 0),
+                    checked: (0, 0, 0, 0, 0),
+                },
+            );
+        }
+        for frame in [0, 3, 7, 10] {
+            for max in [0, 1, 2, 3, 4, 7, 128, 1024, 4096, 10_000] {
+                assert_eq!(q.due(frame, max), due_by_full_sort(&q, frame, max), "frame={frame}, max={max}");
+            }
+        }
     }
 
     /// Textures of which only the smallest levels are held, packed into
