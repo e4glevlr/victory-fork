@@ -879,10 +879,14 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
-/// byte; typed: the format's); `None` if `view` is not a buffer view.
+/// byte; typed: the format's; constant buffers: 16, a row); `None` if
+/// `view` is not a buffer view.
 fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
+        // Made raw (`make`). Rows of 16 bytes, as shaders index constant
+        // buffers in tables (`victory_shader::emit`, per-lane reads).
+        View::Constant(..) => return Some(16),
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
         View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
         View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
@@ -2385,10 +2389,11 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// The title memory a buffer shader or unordered access view, or a
+/// constant buffer view, reads: its address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
+        View::Constant(address, size) => return Some((*address, u64::from(*size))),
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
             desc,
@@ -2999,22 +3004,25 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Made> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+            // Only shaders that pick it from the heap read a title slot's
+            // constant buffer (tables holding one are made afresh), and they
+            // read it as a raw buffer, as the heap's buffer views (its
+            // stride is not 0, `view_stride`): a host constant buffer view
+            // must start on 256 bytes, the title's start on 16, and those
+            // that did not on the host were left null, reading zeros.
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: size / 4,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
             };
-            // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Made::plain(Some(shadow.buffer.clone())))
+            buffer_srv(address, u64::from(size), desc, at).map(Made::plain)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -3275,11 +3283,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        // Read as a raw buffer, as made (`make`).
+        View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -3672,6 +3677,59 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A constant buffer in a title slot is a buffer view for shaders that
+    /// pick it from the heap: a stride, a range to bring up to date, and a
+    /// raw view of its host copy wherever it starts there. Off 256 bytes
+    /// its slot was left null, and those shaders read zeros.
+    #[test]
+    fn heap_constant_buffers_are_raw_views_at_any_alignment() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let len = 1 << 16;
+        // SAFETY: a fresh allocation, kept to the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as u64;
+        assert!(p != 0);
+        let view = View::Constant(p + 16, 64);
+        assert_eq!(view_stride(&view), Some(16));
+        assert_eq!(buffer_range(&view), Some((p + 16, 64)));
+        crate::shadow::register(p as usize, p, len as u64);
+        let made = (|| {
+            let copy = crate::shadow::find(p, len as u64)?;
+            let heap = HostHeap::new(false, 4)?;
+            assert_ne!(
+                copy.gpu(p + 16) % 256,
+                0,
+                "a host constant buffer view could not start there"
+            );
+            let kept = make(&view, heap.cpu(0));
+            let (shown, address, bytes) = buffer_copy(&view).unwrap();
+            Some((copy, kept, shown, address, bytes))
+        })();
+        crate::shadow::unregister(p as usize, p);
+        let Some((copy, kept, shown, address, bytes)) = made else {
+            return; // no host GPU
+        };
+        let kept = kept.and_then(|m| m.kept).expect("a raw view of the host copy");
+        assert_eq!(
+            windows::core::Interface::as_raw(&kept),
+            windows::core::Interface::as_raw(&copy.buffer)
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&shown, &copy),
+            "brought up to date in the copy the slot shows"
+        );
+        assert_eq!((address, bytes), (p + 16, 64));
+        assert!(device_removed().is_none());
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
