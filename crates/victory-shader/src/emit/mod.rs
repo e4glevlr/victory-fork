@@ -3257,4 +3257,64 @@ mod barycentric_tests {
         assert_eq!(rows, [("SV_Position", 0, Some(0)), ("TEXCOORD", 1, Some(2))]);
         validate(&shader);
     }
+
+    /// A pixel quad swizzle reads its quad through quad reads, which see
+    /// helper lanes (wave reads leave them out), with or without discards.
+    #[test]
+    fn pixel_quad_swizzle_without_discards_uses_quad_read_lane_at() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xD8D4_80E4,
+            0x0300_0000, // ds_swizzle_b32 v3, v0 offset:0x80E4
+            v_add_f32(2, 3, 1),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), false, 8).unwrap();
+        let res = resource::track(&p, &[], HwStage::Ps, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let funcs = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .unwrap()
+        .funcs;
+        assert!(funcs.iter().any(|n| n == "dx.op.quadReadLaneAt.i32"), "{funcs:?}");
+        assert!(!funcs.iter().any(|n| n == "dx.op.waveReadLaneAt.i32"), "{funcs:?}");
+    }
 }

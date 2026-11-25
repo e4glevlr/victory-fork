@@ -86,6 +86,9 @@ pub(crate) struct Lowered {
     /// Whether the host may refactor its arithmetic (fuse multiply-adds).
     #[cfg(test)]
     pub refactoring: bool,
+    /// Functions declared in the emitted DXIL module.
+    #[cfg(test)]
+    pub funcs: Vec<String>,
     /// Number of critical-edge blocks recorded in `Lower::edges`.
     #[cfg(test)]
     pub edge_blocks: usize,
@@ -2818,6 +2821,8 @@ impl<'a> Lower<'a> {
             scalar_wave_first: self.scalar_wave_first,
             #[cfg(test)]
             smem_raw_uavs: self.smem_raw_uavs,
+            #[cfg(test)]
+            funcs: self.s.m.func_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5315,7 +5320,9 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            // In a pixel shader a quad read reaches helper lanes (at a triangle's
+            // edge, and discarded pixels), which only quad reads see.
+            let r = if mesh_quad || quad && self.s.pixel {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -7713,7 +7720,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || quad && self.s.pixel {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
