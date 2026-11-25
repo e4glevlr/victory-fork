@@ -64,6 +64,10 @@ param(
     [string]$Out,
     # The title's executable (default: the one .exe in game_dir).
     [string]$Exe,
+    # The diagnostics build to run (default: target\diag\victory.exe). A
+    # copy elsewhere lets a run go on while the tree builds, or two builds
+    # be compared.
+    [string]$Victory,
     # Build the diagnostics build first.
     [switch]$Build,
     # Walk the first-boot screens of a profile with no saves.
@@ -76,7 +80,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$victory = Join-Path $root 'target\diag\victory.exe'
+$victory = if ($Victory) { (Resolve-Path $Victory).Path } else { Join-Path $root 'target\diag\victory.exe' }
+$procName = [IO.Path]::GetFileNameWithoutExtension($victory)
 $invariant = [Globalization.CultureInfo]::InvariantCulture
 if ($Switches -isnot [hashtable]) {
     $table = @{}
@@ -459,7 +464,7 @@ try {
         $t = ((Get-Date) - $launched).TotalSeconds
         if ($proc.HasExited) { $exit = $proc.ExitCode; break }
         # The title runs in a process `victory run` starts: the largest one.
-        $mem = (Get-Process -Name victory -ErrorAction SilentlyContinue | Measure-Object PrivateMemorySize64 -Maximum).Maximum
+        $mem = (Get-Process -Name $procName -ErrorAction SilentlyContinue | Measure-Object PrivateMemorySize64 -Maximum).Maximum
         if ($mem -gt $peak) { $peak = $mem }
         if (-not $worldAt) {
             if ($t -gt $BootTimeout) { Write-Warning "the world did not start within $BootTimeout s"; break }
@@ -492,7 +497,7 @@ try {
     }
 } finally {
     if (-not $proc.HasExited) {
-        Get-Process -Name victory -ErrorAction SilentlyContinue |
+        Get-Process -Name $procName -ErrorAction SilentlyContinue |
             Where-Object { $_.Id -eq $proc.Id -or $_.StartTime -ge $launched } |
             Stop-Process -Force
         $proc.WaitForExit()
