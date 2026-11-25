@@ -367,6 +367,11 @@ struct Lower<'a> {
     traces: bool,
     /// The block a loop stopped by its limit leaves the program from.
     abort: Option<usize>,
+    /// A pixel program that reads first lanes (`v_readfirstlane_b32`): what
+    /// scalar code makes of such a read may differ in helper lanes
+    /// ([`Self::helper_reads_own`]), so every heap index is taken as one that may
+    /// differ between lanes.
+    helper_scalars: bool,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -1979,6 +1984,8 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            helper_scalars: x.native.stage == HwStage::Ps
+                && p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -5201,7 +5208,14 @@ impl<'a> Lower<'a> {
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+    /// A helper lane of a pixel shader takes its own `x` ([`Self::helper_reads_own`]).
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
+        let (first, any) = self.first_lane_of_wave(x, guard);
+        (self.helper_reads_own(x, first), any)
+    }
+
+    /// [`Self::first_lane`] as the host's wave operations see the wave.
+    fn first_lane_of_wave(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
@@ -7076,9 +7090,11 @@ impl<'a> Lower<'a> {
                 self.scalar_wave_first += 1;
             }
             let i32t = self.s.t.i32;
-            d = self
+            let first = self
                 .s
                 .op(self.cur, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+            // A helper lane's term is its own (`helper_reads_own`).
+            d = self.helper_reads_own(d, first);
         }
         Ok(d)
     }
@@ -7235,8 +7251,9 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 // A waterfall loop's load at the first lane's offset reads
-                // each lane's own entry (see `resource::Waterfall`).
-                let per_lane = self.x.res.waterfall.loads.contains(load);
+                // each lane's own entry (see `resource::Waterfall`); in a
+                // pixel program a helper lane may have an offset of its own.
+                let per_lane = self.x.res.waterfall.loads.contains(load) || self.helper_scalars;
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
@@ -7315,7 +7332,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, self.helper_scalars, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -7333,7 +7350,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, index, sampler, self.helper_scalars, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -8710,7 +8727,6 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
-                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
