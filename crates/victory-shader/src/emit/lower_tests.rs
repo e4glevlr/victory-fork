@@ -1648,3 +1648,33 @@ fn only_programs_with_fmad_let_the_host_refactor() {
     assert_eq!(names[..2], ["v_mul_f32", "v_add_f32"]);
     assert!(!apart, "a multiply and an add stay apart");
 }
+
+/// Which programs get globally coherent views: cache-control bits on a
+/// memory or scalar access, a memory atomic or a cache invalidation; not
+/// plain buffer accesses, nor LDS atomics (group memory).
+#[test]
+fn coherent_views_follow_cache_bits_atomics_and_invalidations() {
+    let wants = |body: &[u32]| {
+        let mut words = body.to_vec();
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        super::wants_coherent(&ir::build(&code, false, 8).unwrap())
+    };
+    // buffer_load_dword v1, v0, s[4:7], 0 offen / buffer_store_dword
+    // v1, v0, s[4:7], 0 offen
+    let plain = [0xE030_1000, 0x8001_0100, 0xE070_1000, 0x8001_0100];
+    assert!(!wants(&plain));
+    // ds_add_u32 v0, v1: an atomic on group memory, not on a view.
+    assert!(!wants(&[0xD800_0000, 0x0000_0100]));
+    // The same load with glc (bit 14), dlc (bit 15) or slc (dword 1 bit 22).
+    assert!(wants(&[0xE030_5000, 0x8001_0100]));
+    assert!(wants(&[0xE030_9000, 0x8001_0100]));
+    assert!(wants(&[0xE030_1000, 0x8041_0100]));
+    // buffer_atomic_add v1, v0, s[4:7], 0 offen
+    assert!(wants(&[0xE0C8_1000, 0x8001_0100]));
+    // buffer_gl0_inv
+    assert!(wants(&[0xE1C4_0000, 0x0000_0000]));
+    // s_load_dword s8, s[4:5], 0x0 glc
+    assert!(wants(&[0xF401_0202, 0xFA00_0000]));
+    assert!(!wants(&[0xF400_0202, 0xFA00_0000]));
+}
