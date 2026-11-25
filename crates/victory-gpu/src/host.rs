@@ -107,15 +107,15 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and how many more bytes this process can commit.
+pub(crate) fn available_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -141,15 +141,14 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     }
 }
 
-/// Effective idle timeout (in milliseconds) for system-RAM caches (staging
-/// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
-pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+/// Scale a cache's idle timeout down with available memory. The minimum
+/// timeout is 2,000 ms.
+pub(crate) fn ram_idle_ms(available: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let Some(avail) = avail_phys else {
+    let Some(avail) = available else {
         return NORMAL_MS;
     };
     if avail < 2 * GIB {
@@ -159,6 +158,11 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     } else {
         NORMAL_MS
     }
+}
+
+/// Staging and shadow buffers need both physical RAM and room to commit.
+fn committed_cache_idle_ms(available: Option<(u64, u64)>) -> u64 {
+    ram_idle_ms(available.map(|(physical, commit)| physical.min(commit)))
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -200,9 +204,11 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    let idle_ms = committed_cache_idle_ms(available_memory());
+    crate::shadow::let_go_idle(idle_ms);
+    crate::texture::let_go_idle(idle_ms);
     crate::resource::let_go_idle();
+    crate::placed::let_go_idle();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -8043,8 +8049,18 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging, _, destination) => {
+                    if destination.is_some() {
+                        batch.refresh_textures();
+                    }
                     if batch.texture_due(staging) {
-                        staging.refresh(wait_flight);
+                        if destination.is_none()
+                            && wide_textures()
+                            && staging.in_flight() <= FINISHED.load(Ordering::Acquire)
+                        {
+                            batch.textures_due.push(staging.clone());
+                        } else {
+                            staging.refresh(wait_flight);
+                        }
                     }
                     if let Some(destination) = destination {
                         let preparing = std::time::Instant::now();
@@ -8166,6 +8182,10 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: textures due, refreshed together at the next
+    /// flush (before a step that writes title memory, and before the lists
+    /// run), several at a time.
+    textures_due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -8327,7 +8347,57 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        self.refresh_textures();
     }
+
+    /// The textures queued by [`wide_textures`], several at a time. Each
+    /// refresh reads its texture's title memory and writes its own staging
+    /// buffer and notes (under its own lock); a texture is queued once per
+    /// batch ([`Batch::texture_due`]). Every queued staging buffer already
+    /// passed `in_flight() <= FINISHED` (and `mark_in_flight` only runs
+    /// after `run_deferred`), so no in-flight wait is needed here. The time
+    /// counted is the time it took, not the threads' sum.
+    fn refresh_textures(&mut self) {
+        match self.textures_due.len() {
+            0 => {}
+            1 => {
+                if let Some(staging) = self.textures_due.pop() {
+                    staging.refresh(&mut |_| {});
+                }
+            }
+            _ => {
+                let started = std::time::Instant::now();
+                let before = PREPARING[2].load(Ordering::Relaxed);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+                    .textures_due
+                    .drain(..)
+                    .map(|staging| Box::new(move || staging.refresh(&mut |_| {})) as Box<dyn FnOnce() + Send>)
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Whether a submission's texture checks run several at a time
+/// (`VICTORY_WIDE_TEXTURES=1`; off by default).
+///
+/// While the world streams in, a submission checks hundreds of textures,
+/// one after another on the submitting thread: each is read, hashed whole
+/// and, when it changed, detiled into its staging buffer. On an RTX 3090 Ti
+/// machine that was the frame line's "textures", 100-1,400 ms and 250-930
+/// MB a frame for the first two minutes of the world (the opening
+/// cutscene at 0.3-2 fps, some of its frames white), against about 5 ms
+/// later. The textures have nothing to do with one another, so with the
+/// switch the checks due in a batch are queued and run at its next flush
+/// (before a step that writes title memory, and before the lists run: the
+/// order against those steps is as before) on the threads kept for the
+/// snapshots (`crate::shadow::wide`).
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -9126,6 +9196,15 @@ impl Meter {
                 );
             }
             crate::tiles::status();
+            {
+                let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
+                let [heaps, placed, committed] = crate::placed::stats();
+                tracing::info!(
+                    "host textures of the title's placed textures since the last such line: {made:.0} made, {:.1} us each; with                      VICTORY_PLACED_TEX=1, since the start: {placed} placed in {heaps} heaps ({} MB free in them), {committed} committed instead",
+                    ns / 1e3 / made.max(1.0),
+                    crate::placed::free_bytes() >> 20
+                );
+            }
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
@@ -10261,6 +10340,17 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn committed_caches_expire_sooner_when_commit_is_low() {
+        use super::committed_cache_idle_ms;
+        let gib = 1 << 30;
+        assert_eq!(committed_cache_idle_ms(Some((8 * gib, 400 << 20))), 2_000);
+        assert_eq!(committed_cache_idle_ms(Some((8 * gib, 2 * gib))), 5_000);
+        assert_eq!(committed_cache_idle_ms(Some((gib, 8 * gib))), 2_000);
+        assert_eq!(committed_cache_idle_ms(Some((8 * gib, 4 * gib))), 10_000);
+        assert_eq!(committed_cache_idle_ms(None), 10_000);
     }
 }
 

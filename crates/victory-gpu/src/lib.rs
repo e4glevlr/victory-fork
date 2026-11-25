@@ -55,6 +55,8 @@ mod overlay;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod pix;
 #[cfg(windows)]
+mod placed;
+#[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]
 mod primitive;
