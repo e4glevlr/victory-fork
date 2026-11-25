@@ -83,6 +83,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the host may refactor its arithmetic (fuse multiply-adds).
+    #[cfg(test)]
+    pub refactoring: bool,
     /// Number of critical-edge blocks recorded in `Lower::edges`.
     #[cfg(test)]
     pub edge_blocks: usize,
@@ -2776,6 +2779,11 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
+            refactoring: {
+                self.s.settle_flags();
+                self.s.flags & flags::NO_REFACTORING == 0
+            },
+            #[cfg(test)]
             edge_blocks: self.edges.len(),
             #[cfg(test)]
             no_barrier_blocks: self.no_barrier.len(),
@@ -4065,6 +4073,7 @@ impl<'a> Lower<'a> {
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
+        self.s.fused = true;
         self.s.op(
             self.cur,
             "tertiary.f32",
