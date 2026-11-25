@@ -387,6 +387,10 @@ impl Lower<'_> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // The level comes from the coordinates the size divides: an array's layer
+                // is none of them (DXIL wants it undefined).
+                let mut at = [fu; 3];
+                at[..spatial].copy_from_slice(&cs[..spatial]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let mut lod = self.s.op(
@@ -395,7 +399,7 @@ impl Lower<'_> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, at[0], at[1], at[2], clamped],
                     );
                     if let Some((a, b, take_b)) = other
                         && let Some(lod_b) = self.s.m.call_with(c, lod, a, b)

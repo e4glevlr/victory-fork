@@ -543,6 +543,41 @@ mod tests {
         );
     }
 
+    /// Two elements packed into one register are written in element order, not by column
+    /// (the title's packed pedestrian outputs: TEXCOORD22 in columns 1-2 of the register
+    /// whose column 0 is COLOR0, listed after it).
+    #[test]
+    fn rows_of_one_register_keep_the_element_order() {
+        let element = |name: &str, index, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let part = signature(
+            &[
+                element("TEXCOORD", 19, 13, 0, 3),
+                element("TEXCOORD", 22, 14, 1, 2),
+                element("COLOR", 0, 14, 0, 1),
+                element("TEXCOORD", 21, 15, 0, 3),
+            ],
+            false,
+        );
+        let u32_at = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        // (register, semantic index, mask) of each 32-byte row after the 8-byte header
+        let rows: Vec<(u32, u32, u8)> = (0..4)
+            .map(|k| 8 + 32 * k)
+            .map(|at| (u32_at(at + 20), u32_at(at + 8), part[at + 24]))
+            .collect();
+        assert_eq!(rows, [(13, 19, 0b111), (14, 22, 0b110), (14, 0, 0b1), (15, 21, 0b111)]);
+    }
+
     #[test]
     fn md5_core_matches_the_standard() {
         // Standard MD5 of "abc" with standard padding, through md5_block.
