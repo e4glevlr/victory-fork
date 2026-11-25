@@ -127,7 +127,7 @@ fn indexed_texture_budget() {
         assert_eq!(control_reuploads, 0);
         assert_eq!(control_pending, control_due);
     }
-    assert!(host.texture_slot_gone(0));
+    assert!(host.clear_slot_for_test(0));
     release(existing);
     assert_eq!(live_bytes(), 8 * MIB);
 
@@ -147,7 +147,7 @@ fn indexed_texture_budget() {
     pass();
     let first_live = live_bytes();
     let (pending, _) = host.texture_slots_due(frame + 1, 2);
-    assert!(host.texture_slot_gone(0));
+    assert!(host.clear_slot_for_test(0));
     release(a);
     let released_live = live_bytes();
     let mut token = 0;
