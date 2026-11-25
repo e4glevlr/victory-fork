@@ -1911,15 +1911,38 @@ pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64)
 /// unmapped or moved (`crate::watch::title_memory_remapped`).
 #[cfg(windows)]
 pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
     use std::sync::atomic::Ordering::Relaxed;
     if !sweeping() || len == 0 {
         return 0;
     }
+    let max_size = PLACED_MAX_SIZE.load(Relaxed);
+    if max_size == 0 {
+        return 0;
+    }
+    let lo = (base.saturating_sub(max_size), [0; 14]);
+    let candidates: Vec<usize> = {
+        let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let hi_key;
+        let hi = match base.checked_add(len) {
+            Some(end) => {
+                hi_key = (end, [0; 14]);
+                Excluded(&hi_key)
+            }
+            None => Unbounded,
+        };
+        map.range((Included(&lo), hi)).map(|(_, &at)| at).collect()
+    };
+    if candidates.is_empty() {
+        return 0;
+    }
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
+    for at in candidates {
+        if !all.contains(&at) {
+            continue;
+        }
+        // SAFETY: `at` is present in `all` under its lock (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
@@ -2759,6 +2782,11 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Largest `footprint` byte size seen among resources in [`PLACED_TEXTURES`],
+/// used to bound [`evict_placed_in`] range queries.
+#[cfg(windows)]
+static PLACED_MAX_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(windows)]
@@ -2902,6 +2930,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    PLACED_MAX_SIZE.fetch_max(
+        footprint(&d).map_or(0, |f| f.size),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
