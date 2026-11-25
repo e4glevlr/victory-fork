@@ -8281,9 +8281,30 @@ impl Host {
                 crate::overlay::record(&self.device, list, &back, &mut p.panels[at], (width, height, format));
             }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let capture = if crate::capture::wanted(frame) {
+                static CAPTURE_OVERLAY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let include_overlay = *CAPTURE_OVERLAY.get_or_init(|| {
+                    std::env::var_os("VICTORY_CAPTURE_OVERLAY").is_some_and(|v| v == "1")
+                });
+                if include_overlay {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let captured = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    captured
+                } else {
+                    crate::capture::read_back(&self.device, list, texture)
+                }
+            } else {
+                None
+            };
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
