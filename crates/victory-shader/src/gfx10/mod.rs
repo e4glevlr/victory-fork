@@ -361,18 +361,15 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         }
     } else {
         let vop3 = |encoding: Encoding, op: u32, w1: u32| {
-            let op_name = name(encoding, op as u16);
-            let count = match op_name {
-                Some(n) => fields::vop3_source_count(encoding, op as u16, n),
-                None => 3,
-            };
-            // `v_interp_*_f16` stores {high, chan, attr} in src0, where 0xFF is
-            // attr63.w rather than a 32-bit literal sentinel.
-            let start = usize::from(
-                encoding == Encoding::Vop3
-                    && op_name.is_some_and(|n| n.starts_with("v_interp_")),
-            );
-            let has_lit = (start..count).any(|i| (w1 >> (9 * i)) & 0x1FF == 0xFF);
+            // A literal follows when any of the three source fields is 0xFF,
+            // used by the opcode or not: the title's code has the dword there
+            // (asking only the fields `vop3_source_count` names left 15,882
+            // of its 26,155 programs decoded out of step). The one exception
+            // is `v_interp_*`, whose src0 is {high, chan, attr}, and 0xFF
+            // there is attr63.w.
+            let interp = encoding == Encoding::Vop3
+                && name(encoding, op as u16).is_some_and(|n| n.starts_with("v_interp_"));
+            let has_lit = (usize::from(interp)..3).any(|i| (w1 >> (9 * i)) & 0x1FF == 0xFF);
             2 + usize::from(has_lit)
         };
         match w >> 26 {
@@ -653,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn vop3_interp_attr63_w_and_unused_slots_do_not_consume_literal() {
+    fn vop3_interp_attr63_w_takes_no_literal_and_other_0xff_fields_do() {
         // v_interp_p1ll_f16 (0x342) with src0 = 0xFF (attr63.w, high=0), src1 = v0 (256)
         let p1ll = [0xD400_0000 | (0x342 << 16), (256 << 9) | 0xFF];
         // v_interp_p2_f16 (0x35a) with src0 = 0xFF (attr63.w), src1 = v1, src2 = v2
@@ -661,20 +658,18 @@ mod tests {
             0xD400_0000 | (0x35A << 16),
             (258 << 18) | (257 << 9) | 0xFF,
         ];
-        // 1-source VOP3 v_mov_b32 (0x181) with 0xFF in unused src1/src2
+        // 1-source VOP3 v_mov_b32 (0x181) with 0xFF in its unused src1/src2:
+        // a literal follows, as in the title's code
         let vop1_vop3 = [
             0xD400_0000 | (0x181 << 16),
             (0xFF << 18) | (0xFF << 9) | 256,
+            0x1234_5678,
         ];
-        // 2-source VOP3 v_add_f32 (0x103) with 0xFF in unused src2
-        let vop2_vop3 = [
-            0xD400_0000 | (0x103 << 16),
-            (0xFF << 18) | (257 << 9) | 256,
-        ];
-        // 2-source VOP3P v_pk_add_f16 (0x00f) with 0xFF in unused src2
+        // 2-source VOP3P v_pk_add_f16 (0x00f) with 0xFF in its unused src2
         let vop3p = [
             0xCC00_0000 | (0x00F << 16),
             (0xFF << 18) | (257 << 9) | 256,
+            0x1234_5678,
         ];
         // s_getpc_b64 s[0:1] with 0xFF in its unused ssrc0 field
         let getpc = 0xBE80_1FFF;
@@ -686,10 +681,10 @@ mod tests {
             p2[1],
             vop1_vop3[0],
             vop1_vop3[1],
-            vop2_vop3[0],
-            vop2_vop3[1],
+            vop1_vop3[2],
             vop3p[0],
             vop3p[1],
+            vop3p[2],
             getpc,
             S_ENDPGM,
         ];
@@ -698,9 +693,8 @@ mod tests {
             [
                 (0, 2, "v_interp_p1ll_f16"),
                 (8, 2, "v_interp_p2_f16"),
-                (16, 2, "v_mov_b32"),
-                (24, 2, "v_add_f32"),
-                (32, 2, "v_pk_add_f16"),
+                (16, 3, "v_mov_b32"),
+                (28, 3, "v_pk_add_f16"),
                 (40, 1, "s_getpc_b64"),
                 (44, 1, "s_endpgm"),
             ]
