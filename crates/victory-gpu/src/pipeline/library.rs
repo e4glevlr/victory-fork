@@ -517,7 +517,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let compiling = std::time::Instant::now();
+        let made = create();
+        slow_compile(compiling.elapsed());
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -541,11 +544,13 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
+    let compiling = std::time::Instant::now();
     let pso = {
         let _call = call("make", name);
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    slow_compile(compiling.elapsed());
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -562,6 +567,19 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+/// Driver compiles slower than this are named in the log: a pipeline that
+/// takes the driver seconds keeps its draws dropped all that time, and
+/// holds a worker (and a processor) the title's frames then lack.
+const SLOW_COMPILE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Logs the pipeline this thread made (its [`label`]) if `took` was slow.
+fn slow_compile(took: std::time::Duration) {
+    if took >= SLOW_COMPILE {
+        let label = LABEL.with(|l| l.borrow().clone());
+        tracing::info!(seconds = took.as_secs_f64(), shaders = %label, "slow driver compile of a host pipeline");
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
