@@ -420,9 +420,10 @@ function Get-Frame([double]$timeout = 5) {
 $saved = @{}
 $pix = Join-Path $Out 'pix'
 $set = @{
-    VICTORY_DATA_DIR  = $runData
-    VICTORY_KEYS_FILE = $keys
-    VICTORY_CAPTURE   = $frames
+    VICTORY_DATA_DIR    = $runData
+    VICTORY_KEYS_FILE   = $keys
+    VICTORY_CAPTURE     = $frames
+    VICTORY_OVERLAY_LOG = Join-Path $Out 'overlay.log'
 }
 if ($PixAt -ge 0) { $set['VICTORY_PIX'] = $pix }
 foreach ($k in $Switches.Keys) { $set[$k] = [string]$Switches[$k] }
