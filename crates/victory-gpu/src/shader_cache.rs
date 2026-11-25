@@ -81,6 +81,8 @@ fn build() -> &'static [u8; 32] {
         ] {
             hash.update(&n.to_le_bytes());
         }
+        // On which stages those passes ran.
+        hash.update(&[victory_shader::emit::shader_opt_stages()]);
         // So are the switches that pick the form of a wave64 program:
         // without them here a run with `VICTORY_WAVE_WIDE=0` was served
         // the translations an earlier run had cached with the switch unset.
