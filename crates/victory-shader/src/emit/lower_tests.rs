@@ -1244,3 +1244,142 @@ fn sums_of_absolute_differences_lower() {
         lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
     }
 }
+
+/// Lowers a pixel program with the input VGPRs `input_addr` enables, one
+/// float4 TEXCOORD0 attribute (attr 0, row 0), two float4 targets, and the
+/// root parameters `layout` with the resources `used`.
+fn lower_pixel(
+    words: &[u32],
+    input_addr: u32,
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+) -> Result<Lowered, crate::ShaderError> {
+    use super::super::container::SigElement;
+    use crate::native::{PsInput, Usage};
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 16,
+        layout,
+        used,
+        io: StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0xF,
+                attr: 0,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            }],
+            input_addr,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let element = |name: &str, kind, row, interp, usage| SigElement {
+        name: name.into(),
+        index: row,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(row),
+        col: 0,
+        cols: 4,
+        usage,
+        half: false,
+    };
+    let p = ir::build(&native.patched_code(), false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![element("TEXCOORD", 0, 0, 2, 0)],
+        outputs: vec![
+            element("SV_Target", 16, 0, 0, 15),
+            element("SV_Target", 16, 1, 0, 15),
+        ],
+        prims: vec![],
+        mesh_stride: 0,
+        view_marks: false,
+    })
+}
+
+/// An alpha test (`v_cmpx` on EXEC) before two targets: the lanes the
+/// first export leaves out are the ones the `done` export discards, so it
+/// stores in every lane. With EXEC restored before the `done` export
+/// those lanes live on, and the export stays refused.
+#[test]
+fn an_export_before_the_discarding_done_export_stores_unguarded() {
+    let program = |restore: bool| {
+        let mut words = vec![
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xBE8C_037E, // s_mov_b32 s12, exec_lo
+            0x7C22_0480, // v_cmpx_lt_f32 0, v2
+            0xF800_100F,
+            0x0202_0202, // exp mrt0 v2, v2, v2, v2 vm
+        ];
+        if restore {
+            words.push(0xBEFE_030C); // s_mov_b32 exec_lo, s12
+        }
+        words.extend([
+            0xF800_181F,
+            0x0202_0202, // exp mrt1 v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        lower_pixel(&words, 1 << 1, vec![], vec![]).map(|_| ())
+    };
+    program(false).unwrap();
+    let e = program(true).unwrap_err().to_string();
+    assert!(e.contains("a conditional export"), "{e}");
+}
+
+/// A level query on an array texture reads no slice: here its register
+/// holds the ancillary input, which has no DXIL form.
+#[test]
+fn a_level_query_skips_the_array_slice() {
+    let words = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xF40C_0000,
+        0xFA00_0000, // s_load_dwordx8 s[0:7], s[0:1], null
+        0xBE88_0380, // s_mov_b32 s8, 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+        0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+        0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y
+        0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y
+        0x7E0A_0302, // v_mov_b32 v5, v2 (the ancillary input)
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xF180_0328,
+        0x0040_0603, // image_get_lod v[6:7], v[3:5], s[0:7], s[8:11] dmask:0x3 dim:2D_ARRAY
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_180F,
+        0x0706_0706, // exp mrt0 v6, v7, v6, v7 done vm
+        S_ENDPGM,
+    ];
+    let texture = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 0,
+        slot: 0,
+    };
+    let table = RootParam {
+        sgprs: 1,
+        ..root(RootType::Table, 0, 0)
+    };
+    lower_pixel(&words, 1 << 1 | 1 << 13, vec![table], vec![texture]).unwrap();
+}

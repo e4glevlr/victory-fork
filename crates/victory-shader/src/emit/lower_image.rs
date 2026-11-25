@@ -356,7 +356,10 @@ impl Lower<'_> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // A level query takes no array slice (the code may pass anything
+            // there; DXC leaves that coordinate undefined).
+            let read = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(read) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
