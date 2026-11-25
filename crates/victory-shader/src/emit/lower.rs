@@ -6074,7 +6074,8 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // SCC: whether the first operand was chosen (RDNA2 ISA).
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -9973,9 +9974,11 @@ impl<'a> Lower<'a> {
                     let lt = self.s.m.cmp(c, pred::OLT, a, b);
                     let gt = self.s.m.cmp(c, pred::OGT, a, b);
                     self.s.m.bin(c, Bin::Or, lt, gt)
+                } else if op == "f" || op == "tru" {
+                    // A constant: `fcmp false`/`fcmp true` removes the WARP device.
+                    self.s.m.bool(op == "tru")
                 } else {
                     let p = match op {
-                        "f" => pred::FALSE,
                         "lt" => pred::OLT,
                         "eq" => pred::OEQ,
                         "le" => pred::OLE,
@@ -9989,7 +9992,6 @@ impl<'a> Lower<'a> {
                         "nle" => pred::UGT,
                         "neq" => pred::UNE,
                         "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
                         _ => return Err(inst.name()),
                     };
                     self.s.m.cmp(c, p, a, b)

@@ -113,6 +113,9 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // Not emitted (nor TRUE): `fcmp false` removes the WARP device, so
+    // `v_cmp_f` and `v_cmp_tru` lower as constants.
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;

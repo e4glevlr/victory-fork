@@ -246,6 +246,113 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
     }
 }
 
+/// Lowers a one-thread compute program that copies four root constants
+/// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
+/// descriptor table, so the vector instructions in `body` have an effect.
+fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    lower_valu(body).map(|_| ())
+}
+
+/// [`lowers_valu`]'s program, lowered.
+fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+    ];
+    // v_mov_b32 v1..v4, s0..s3
+    words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
+    words.extend_from_slice(body);
+    words.extend_from_slice(&[
+        0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+        0x8002_0000,
+        S_ENDPGM,
+    ]);
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    lower_with(
+        &words,
+        vec![constants, root(RootType::Table, 4, 1)],
+        vec![buffer],
+    )
+}
+
+/// Whether the lowered program declares wave operations (`SFI0` 0x4000), which the clean-up
+/// drops with the last one it keeps.
+fn has_wave_ops(l: &Lowered) -> bool {
+    let container = crate::Container::parse(&l.dxil).unwrap();
+    let features = container.part(crate::FourCC::SFI0).unwrap();
+    u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0
+}
+
+#[test]
+fn scalar_min_and_max_set_scc_from_the_compare() {
+    // `op s12, 0, 1` or `op s12, 0, -1`, then `s_cselect_b32 s14` between the constant 2
+    // (on the SCC the RDNA2 ISA gives: whether the first operand was chosen) and a wave
+    // read (on the other), stored. With constant operands the right SCC leaves no wave
+    // operation; `result != 0` would pick the read in every case here.
+    let first = 0x850E_0D82; // s_cselect_b32 s14, 2, s13
+    let second = 0x850E_820D; // s_cselect_b32 s14, s13, 2
+    for (op, select) in [
+        (0x838C_8180u32, first), // s_min_u32 s12, 0, 1: 0, SCC 1
+        (0x848C_8180, second),   // s_max_u32 s12, 0, 1: 1, SCC 0
+        (0x830C_C180, second),   // s_min_i32 s12, 0, -1: -1, SCC 0
+        (0x840C_C180, first),    // s_max_i32 s12, 0, -1: 0, SCC 1
+    ] {
+        let body = [
+            0x7E1A_0501, // v_readfirstlane_b32 s13, v1
+            op,
+            select,
+            0x7E00_020E, // v_mov_b32 v0, s14
+        ];
+        let l = lower_valu(&body).unwrap_or_else(|e| panic!("{op:#x}: {e}"));
+        assert!(!has_wave_ops(&l), "{op:#x}: the select took the wave read");
+    }
+}
+
+#[test]
+fn always_false_and_always_true_compares_are_constants() {
+    // `v_cmp_{f,tru}_{f32,f16} vcc, v1, v2`, then `v_cndmask_b32 v0` between v2 (where the
+    // constant mask points) and a wave read in v5. A host `fcmp false`/`fcmp true` stays a
+    // compare (the WARP device is removed by one), so both sides would stay.
+    let wave = [
+        0x7E1A_0501, // v_readfirstlane_b32 s13, v1
+        0x7E0A_020D, // v_mov_b32 v5, s13
+    ];
+    for (cmp, select) in [
+        (0x7C00_0501u32, 0x0200_0B02u32), // v_cmp_f_f32; v_cndmask_b32 v0, v2, v5, vcc
+        (0x7C1E_0501, 0x0200_0505),       // v_cmp_tru_f32; v_cndmask_b32 v0, v5, v2, vcc
+        (0x7D90_0501, 0x0200_0B02),       // v_cmp_f_f16
+        (0x7DDE_0501, 0x0200_0505),       // v_cmp_tru_f16
+    ] {
+        let l = lower_valu(&[wave[0], wave[1], cmp, select])
+            .unwrap_or_else(|e| panic!("{cmp:#x}: {e}"));
+        assert!(!has_wave_ops(&l), "{cmp:#x}: the compare is not a constant");
+    }
+}
+
+#[test]
+fn the_24_bit_multiplies_lower_both_halves() {
+    // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
+    // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
+    for op in [0x09u32, 0x0A, 0x0B, 0x0C] {
+        let word = op << 25 | 2 << 9 | 0x101;
+        lowers_valu(&[word]).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
+    }
+}
+
 #[test]
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
@@ -1128,55 +1235,6 @@ fn heap_descriptor_address_reads_from_view_table() {
     assert!(l.root_srvs.contains(&super::super::SLOT_MEMORY));
 }
 
-/// Lowers a one-thread compute program that copies four root constants
-/// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
-/// descriptor table, so the vector instructions in `body` have an effect.
-fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
-    let mut words = vec![
-        0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
-        0xFA00_0000,
-    ];
-    // v_mov_b32 v1..v4, s0..s3
-    words.extend((0..4u32).map(|i| 0x7E00_0200 | (i + 1) << 17 | i));
-    words.extend_from_slice(body);
-    words.extend_from_slice(&[
-        0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
-        0x8002_0000,
-        S_ENDPGM,
-    ]);
-    let constants = RootParam {
-        sgprs: 4,
-        ..root(RootType::Constants, 0, 0)
-    };
-    let buffer = UsedResource {
-        kind: ResourceType::Uav,
-        root: RootType::Table,
-        table_offset_dwords: 0,
-        lower_bound: 0,
-        stride: 0,
-        dwords: 4,
-        user_data: 4,
-        slot: 1,
-    };
-    lower_with(
-        &words,
-        vec![constants, root(RootType::Table, 4, 1)],
-        vec![buffer],
-    )
-    .map(|_| ())
-}
-
-#[test]
-fn the_24_bit_multiplies_lower_both_halves() {
-    // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
-    // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
-    for op in [0x09u32, 0x0A, 0x0B, 0x0C] {
-        let word = op << 25 | 2 << 9 | 0x101;
-        lowers_valu(&[word]).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
-    }
-}
-
 #[test]
 fn sums_of_absolute_differences_lower() {
     // VOP3 `op v0, v1, v2, v3`: v_sad_u8, v_sad_hi_u8, v_sad_u16,
@@ -1186,4 +1244,3 @@ fn sums_of_absolute_differences_lower() {
         lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
     }
 }
-
