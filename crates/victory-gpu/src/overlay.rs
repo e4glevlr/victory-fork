@@ -153,7 +153,10 @@ pub(crate) fn presented(width: u32, height: u32) -> bool {
         SHOWN.store(on, Ordering::Relaxed);
         tracing::info!(shown = on, "overlay (F3 shows or hides it)");
     });
-    SIZE.store(u64::from(width) << 32 | u64::from(height), Ordering::Relaxed);
+    SIZE.store(
+        u64::from(width) << 32 | u64::from(height),
+        Ordering::Relaxed,
+    );
     {
         let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -220,10 +223,19 @@ fn processor() -> (f64, f64) {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
     static LAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
     let ticks = |t: FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
-    let [mut created, mut exited, mut kernel, mut user, mut now] = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 5];
+    let [mut created, mut exited, mut kernel, mut user, mut now] = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 5];
     // SAFETY: our own process and structures we own.
     unsafe {
-        GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user);
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        );
         GetSystemTimeAsFileTime(&mut now);
     }
     let (busy, now) = (ticks(kernel) + ticks(user), ticks(now));
@@ -243,7 +255,11 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     let [count, total_ms, max_ms] = [0, 1, 2].map(|i| SLOW[i].load(Ordering::Relaxed));
     static CARD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let card = CARD.get_or_init(|| crate::host::host().and_then(|h| h.card_name()).unwrap_or_default());
+    let card = CARD.get_or_init(|| {
+        crate::host::host()
+            .and_then(|h| h.card_name())
+            .unwrap_or_default()
+    });
     let size = SIZE.load(Ordering::Relaxed);
     let (busy, up) = processor();
     out.push((
@@ -262,15 +278,27 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     } else {
         RED
     };
-    out.push((fps_colour, format!("{:5.1} fps   {:7.1} ms/frame", s.fps, s.ms)));
+    out.push((
+        fps_colour,
+        format!("{:5.1} fps   {:7.1} ms/frame", s.fps, s.ms),
+    ));
     {
-        let mut times: Vec<f32> = TIMES.lock().unwrap_or_else(|e| e.into_inner()).1.iter().copied().collect();
+        let mut times: Vec<f32> = TIMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .iter()
+            .copied()
+            .collect();
         if !times.is_empty() {
             times.sort_unstable_by(f32::total_cmp);
             let median = times[times.len() / 2];
             let p95 = times[times.len() * 95 / 100];
             let worst = times[times.len() - 1];
-            let hitches = times.iter().filter(|&&ms| ms > 2.0 * median.max(1.0)).count();
+            let hitches = times
+                .iter()
+                .filter(|&&ms| ms > 2.0 * median.max(1.0))
+                .count();
             out.push((
                 if hitches > 0 { YELLOW } else { GREY },
                 format!(
@@ -290,13 +318,22 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
         ("preparing (submitting thread)", s.preparing),
         ("GPU", s.gpu),
         ("copying back", s.back_ms),
-        ("heap passes in the title's recording threads", s.heap_pass_ms),
+        (
+            "heap passes in the title's recording threads",
+            s.heap_pass_ms,
+        ),
     ];
     let (worst, worst_ms) = parts
         .iter()
         .copied()
         .fold(("", 0.0), |a, b| if b.1 > a.1 { b } else { a });
-    let colour = |ms: f64| if ms == worst_ms && ms > 0.0 { RED } else { WHITE };
+    let colour = |ms: f64| {
+        if ms == worst_ms && ms > 0.0 {
+            RED
+        } else {
+            WHITE
+        }
+    };
     out.push((
         colour(s.preparing),
         format!(
@@ -367,7 +404,11 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     }
     let processors = std::thread::available_parallelism().map_or(1, usize::from);
     out.push((
-        if busy >= 90.0 * processors as f64 { RED } else { WHITE },
+        if busy >= 90.0 * processors as f64 {
+            RED
+        } else {
+            WHITE
+        },
         format!("processor: {busy:.0}% of one ({processors} in all)"),
     ));
     let dropped_colour = if s.dropped >= 1.0 { YELLOW } else { WHITE };
@@ -427,7 +468,13 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
         ),
     ));
     if crate::shadow::cards() {
-        out.push((GREY, format!("  copies in the card's memory: {:.1} MB sent up", s.card_sent_mb)));
+        out.push((
+            GREY,
+            format!(
+                "  copies in the card's memory: {:.1} MB sent up",
+                s.card_sent_mb
+            ),
+        ));
     }
     let gb = |b: u64| b as f64 / f64::from(1u32 << 30);
     let video = crate::host::host().and_then(|h| h.video_memory());
@@ -475,7 +522,11 @@ fn draw_text(lines: &[(u32, String)], line: u32, version: u64) -> Option<Text> {
         );
         let old_font = SelectObject(dc, font.into());
         let mut size = windows::Win32::Foundation::SIZE::default();
-        let widest = lines.iter().map(|(_, t)| t.chars().count()).max().unwrap_or(1);
+        let widest = lines
+            .iter()
+            .map(|(_, t)| t.chars().count())
+            .max()
+            .unwrap_or(1);
         let _ = GetTextExtentPoint32W(dc, w!("M").as_wide(), &mut size);
         let pad = line / 2;
         let width = (size.cx.max(1) as u32 * widest as u32 + 2 * pad).next_multiple_of(4);
@@ -532,7 +583,9 @@ fn draw_text(lines: &[(u32, String)], line: u32, version: u64) -> Option<Text> {
 /// Bytes per pixel of the back buffer formats [`crate::host`] presents.
 fn bytes_per_pixel(format: DXGI_FORMAT) -> Option<u32> {
     match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => Some(4),
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => {
+            Some(4)
+        }
         DXGI_FORMAT_R16G16B16A16_FLOAT => Some(8),
         _ => None,
     }
@@ -583,7 +636,9 @@ pub(crate) fn record(
     panel: &mut Option<Panel>,
     (width, height, format): (u32, u32, DXGI_FORMAT),
 ) {
-    let Some(bpp) = bytes_per_pixel(format) else { return };
+    let Some(bpp) = bytes_per_pixel(format) else {
+        return;
+    };
     let (version, lines) = LINES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if version == 0 {
         return;
@@ -591,7 +646,10 @@ pub(crate) fn record(
     // The text: once per figures, a line a 64th of the frame's height.
     let line = (height / 64).clamp(12, 34);
     let mut text = TEXT.lock().unwrap_or_else(|e| e.into_inner());
-    if text.as_ref().is_none_or(|t| t.version != version || t.line != line) {
+    if text
+        .as_ref()
+        .is_none_or(|t| t.version != version || t.line != line)
+    {
         let drawn = draw_text(&lines, line, version);
         if drawn.is_none() {
             tracing::warn!("overlay text not drawn");
@@ -633,14 +691,20 @@ pub(crate) fn record(
         let times = TIMES.lock().unwrap_or_else(|e| e.into_inner()).1.clone();
         let mut sorted: Vec<f32> = times.iter().copied().collect();
         sorted.sort_unstable_by(f32::total_cmp);
-        let top = sorted.last().map_or(100.0, |&worst| graph_top(sorted[sorted.len() / 2], worst));
+        let top = sorted
+            .last()
+            .map_or(100.0, |&worst| graph_top(sorted[sorted.len() / 2], worst));
         let bar = w.div_ceil(HISTORY as u32).max(2);
         let at_30 = rows - ((33.3 / top) * rows as f32) as u32;
         for y in 0..rows {
             let row = &mut pixels[((text_rows + y) * pitch) as usize..][..(w * bpp) as usize];
             for x in 0..w {
                 let from_right = ((w - 1 - x) / bar) as usize;
-                let colour = match times.len().checked_sub(1 + from_right).and_then(|i| times.get(i)) {
+                let colour = match times
+                    .len()
+                    .checked_sub(1 + from_right)
+                    .and_then(|i| times.get(i))
+                {
                     Some(&ms) if y >= rows - ((ms.min(top) / top) * rows as f32) as u32 => {
                         if ms <= 34.0 {
                             [96, 224, 96, 255]
@@ -663,7 +727,9 @@ pub(crate) fn record(
         // SAFETY: borrowed for the call, as the copy locations are used.
         pResource: unsafe { std::mem::transmute_copy(back) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: 0,
+        },
     };
     let from = D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: as above.
@@ -699,7 +765,10 @@ fn make(device: &ID3D12Device, w: u32, h: u32, pitch: u32, format: DXGI_FORMAT) 
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
@@ -757,7 +826,10 @@ mod tests {
         put(DXGI_FORMAT_B8G8R8A8_UNORM, &mut px, bgra);
         assert_eq!(px[..4], [10, 20, 255, 128]);
         put(DXGI_FORMAT_R10G10B10A2_UNORM, &mut px, [0, 0, 255, 255]);
-        assert_eq!(u32::from_le_bytes(px[..4].try_into().unwrap()), 1023 | 3 << 30);
+        assert_eq!(
+            u32::from_le_bytes(px[..4].try_into().unwrap()),
+            1023 | 3 << 30
+        );
         put(DXGI_FORMAT_R16G16B16A16_FLOAT, &mut px, [0, 0, 255, 255]);
         // 1.0 as a half is 0x3c00; blue 0.
         assert_eq!(px, [0x00, 0x3c, 0, 0, 0, 0, 0x00, 0x3c]);
