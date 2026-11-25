@@ -368,7 +368,8 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
-/// run that block are not all of the wave.
+/// run that block are not all of the wave (and no scalar operation on numbers gives it,
+/// [`Lower::mask_number`]).
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -3678,20 +3679,35 @@ impl<'a> Lower<'a> {
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where every lane of
         // the wave runs that block (two exchanging host waves know it; a native compute
-        // program's wave is the console's, so its lane branches tell).
-        if !self.x.st.active.contains(&lo) {
+        // program's wave is the console's, so its lane branches tell). Elsewhere, with
+        // console lanes, it is the scalar operation writing it applied to its operands'
+        // numbers ([`Self::mask_number`]).
+        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
             let made = self.def_block.get(&lo).copied();
-            let whole = self.mask_data == MaskData::Console
-                && !self.local
+            let console = self.mask_data == MaskData::Console && !self.local;
+            let whole = console
                 && made.is_none_or(|b| match &self.exchange {
                     Some(_) => self.all_lanes(b),
                     None => all_lane_blocks(self.x.st).is_some_and(|all| all.get(b).copied().unwrap_or(false)),
                 });
             if !whole {
-                if self.mask_data == MaskData::Console && !self.local {
-                    need(made.unwrap_or(0));
-                }
-                return Err(MASK_ELSEWHERE);
+                let needs = NEEDS.with_borrow(Vec::len);
+                let xy = if console && self.balloting.insert(lo) {
+                    let xy = self.mask_number(lo);
+                    self.balloting.remove(&lo);
+                    xy
+                } else {
+                    None
+                };
+                let Some(xy) = xy else {
+                    // (blocks its operands' exchanges wanted are no need of this refusal)
+                    NEEDS.with_borrow_mut(|n| n.truncate(needs));
+                    if console {
+                        need(made.unwrap_or(0));
+                    }
+                    return Err(MASK_ELSEWHERE);
+                };
+                self.ballots.insert(lo, xy);
             }
         }
         let (x, y) = match self.ballots.get(&lo) {
@@ -3735,6 +3751,100 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Both dwords of a mask holding lanes outside the block writing it (the complement of a
+    /// ballot, say), which no ballot there gives: the scalar operation writing it applied to
+    /// its operands' numbers, as the console does. None for any other writer.
+    fn mask_number(&mut self, lo: Value) -> Option<(V, V)> {
+        let p = self.x.p;
+        let b = *self.def_block.get(&lo)?;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } = &inst.fields
+        else {
+            return None;
+        };
+        let wave64 = self.x.native.wave64;
+        let width = if wave64 { "_b64" } else { "_b32" };
+        let op = inst.name().strip_prefix("s_")?.strip_suffix(width)?;
+        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+            return None;
+        }
+        // (operation on src0 and src1, complement src1 first, complement the result)
+        let (f, not_c, not_r) = match op {
+            "mov" | "cselect" => (None, false, false),
+            "not" => (None, false, true),
+            "and" => (Some(Bin::And), false, false),
+            "or" => (Some(Bin::Or), false, false),
+            "xor" => (Some(Bin::Xor), false, false),
+            "andn2" => (Some(Bin::And), true, false),
+            "orn2" => (Some(Bin::Or), true, false),
+            "nand" => (Some(Bin::And), false, true),
+            "nor" => (Some(Bin::Or), false, true),
+            "xnor" => (Some(Bin::Xor), false, true),
+            _ => return None,
+        };
+        let scc = match op {
+            "cselect" => Some(self.scc_in(inst).ok()?),
+            _ => None,
+        };
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b]?
+        };
+        // Dword `h` of source `k` (inline constants sign-extend, literals do not; a 64-bit
+        // operation reads float constants as doubles).
+        let word = |l: &mut Self, k: usize, h: u8| -> Option<V> {
+            let x = match *src.get(k)? {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    return match l.get(inst.read(Reg::S(code + h))?).ok()? {
+                        Val::I32(x) => Some(x),
+                        _ => None,
+                    };
+                }
+                Operand::Const(c) if !wave64 || c <= 208 => {
+                    let x = crate::resource::inline(c)?;
+                    match h {
+                        0 => x,
+                        _ if (x as i32) < 0 => u32::MAX,
+                        _ => 0,
+                    }
+                }
+                Operand::Literal(x) if h == 0 => x,
+                Operand::Literal(_) => 0,
+                _ => return None,
+            };
+            Some(l.s.m.i32(x))
+        };
+        let ones = self.s.m.i32(u32::MAX);
+        let mut out = [self.s.m.i32(0); 2];
+        for h in 0..1 + u8::from(wave64) {
+            let a = word(self, 0, h)?;
+            let mut r = a;
+            if f.is_some() || scc.is_some() {
+                let mut c = word(self, 1, h)?;
+                if not_c {
+                    c = self.s.m.bin(at, Bin::Xor, c, ones);
+                }
+                r = match f {
+                    Some(f) => self.s.m.bin(at, f, a, c),
+                    None => self.s.m.select(at, scc?, a, c),
+                };
+            }
+            if not_r {
+                r = self.s.m.bin(at, Bin::Xor, r, ones);
+            }
+            out[usize::from(h)] = r;
+        }
+        Some((out[0], out[1]))
     }
 
     // ---- operands ----

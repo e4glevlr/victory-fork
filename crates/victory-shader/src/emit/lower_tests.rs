@@ -1481,3 +1481,47 @@ fn a_level_query_skips_the_array_slice() {
     };
     lower_pixel(&words, 1 << 1 | 1 << 13, vec![table], vec![texture]).unwrap();
 }
+
+/// The complement of a ballot (its bits for the lanes that skip the branch set) counted inside
+/// that branch: no ballot there holds those lanes, so the count is `s_not` applied to the
+/// compare's ballot, as the console computes it (and `s_orn2` against EXEC). Waves of 32 and
+/// of 64.
+#[test]
+fn a_complemented_ballot_counts_where_not_every_lane_runs() {
+    let wave32 = [
+        0x7D8A_0080u32, // v_cmp_ne_u32 vcc_lo, 0, v0
+        0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+        0xBF88_0006,    // s_cbranch_execz -> s_or_b32
+        0x7D82_0085,    // v_cmp_lt_u32 vcc_lo, 5, v0
+        0xBE81_076A,    // s_not_b32 s1, vcc_lo
+        0xBE82_0F01,    // s_bcnt1_i32_b32 s2, s1
+        0x7E02_0202,    // v_mov_b32 v1, s2
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+        S_ENDPGM,
+    ];
+    let wave64 = [
+        0x7D8A_0080u32, // v_cmp_ne_u32 vcc, 0, v0
+        0xBE80_246A,    // s_and_saveexec_b64 s[0:1], vcc
+        0xBF88_0006,    // s_cbranch_execz -> s_or_b64
+        0x7D82_0085,    // v_cmp_lt_u32 vcc, 5, v0
+        0xBE82_086A,    // s_not_b64 s[2:3], vcc
+        0xBE84_1002,    // s_bcnt1_i32_b64 s4, s[2:3]
+        0x7E02_0204,    // v_mov_b32 v1, s4
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        0x88FE_007E, // s_or_b64 exec, exec, s[0:1]
+        S_ENDPGM,
+    ];
+    let mut orn2 = wave32;
+    orn2[4] = 0x8B01_6A7E; // s_orn2_b32 s1, exec_lo, vcc_lo
+    for (words, wave64) in [
+        (&wave32[..], false),
+        (&orn2[..], false),
+        (&wave64[..], true),
+    ] {
+        let l = lower_wave(words, vec![], vec![], wave64).unwrap();
+        assert!(l.wave_ops);
+    }
+}
