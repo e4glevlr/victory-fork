@@ -5468,8 +5468,11 @@ impl<'a> Lower<'a> {
                 };
                 self.write(inst, Reg::V(reg), x, guard);
             } else {
-                // Clear, then set: two atomics, so lanes writing other
-                // bytes of the dword keep theirs.
+                // The part replaces its bits of the dword in one
+                // compare-exchange, retried while another lane changes the
+                // dword: lanes writing other parts of it all land, and no
+                // reader sees the part cleared. A clear and a set as two
+                // atomics would OR together lanes writing the same part.
                 let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
                 if name != base {
                     // The data's high half.
@@ -5481,10 +5484,11 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
-                use super::bitcode::Rmw;
                 let at = self.begin_guarded(guard);
-                self.s.m.atomic(self.cur, Rmw::And, p, keep);
-                self.s.m.atomic(self.cur, Rmw::Or, p, x);
+                self.lds_rmw_loop(p, |l, old| {
+                    let kept = l.s.m.bin(l.cur, Bin::And, old, keep);
+                    l.s.m.bin(l.cur, Bin::Or, kept, x)
+                });
                 self.end_guarded(at, &[]);
             }
             return Ok(());
