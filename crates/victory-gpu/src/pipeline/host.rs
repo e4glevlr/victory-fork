@@ -549,6 +549,7 @@ impl HostPipeline {
                             || slot == victory_shader::emit::SLOT_VIEW_WRITES
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            || slot == victory_shader::emit::SLOT_VIEWS
                             || slot == victory_shader::emit::SLOT_MEMORY
                             || slot == victory_shader::emit::SLOT_VIEW_MARKS
                     };
