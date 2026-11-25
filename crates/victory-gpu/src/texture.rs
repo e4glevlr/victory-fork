@@ -684,7 +684,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
+        list.defer_texture(staging, false);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -751,7 +751,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         });
     }
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging, true);
 }
 
 impl Staging {
@@ -780,25 +780,27 @@ impl Staging {
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    /// since the last time (and is mapped at all). Before overwriting the
+    /// staging buffer, invokes `wait_flight` if an unfinished submission may
+    /// still be reading it on the GPU.
+    pub(crate) fn refresh(&self, wait_flight: &mut dyn FnMut(u64)) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(wait_flight);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, wait_flight: &mut dyn FnMut(u64)) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(wait_flight);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, wait_flight: &mut dyn FnMut(u64)) -> usize {
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -812,7 +814,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(read, wait_flight);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -888,7 +890,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, wait_flight);
             };
             mapped
         } else {
@@ -919,7 +921,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.detile(read, wait_flight);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -938,7 +940,7 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(tiled);
+                self.detile(tiled, wait_flight);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -954,7 +956,7 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(tiled, wait_flight);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -966,7 +968,7 @@ impl Staging {
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, wait_flight: &mut dyn FnMut(u64)) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
@@ -975,7 +977,7 @@ impl Staging {
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                self.detile(read, wait_flight);
             }
             true
         });
@@ -990,7 +992,11 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8], wait_flight: &mut dyn FnMut(u64)) {
+        let need = self.in_flight();
+        if need != 0 {
+            wait_flight(need);
+        }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
