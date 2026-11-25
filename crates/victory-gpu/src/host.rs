@@ -434,15 +434,17 @@ fn card_clock_watch(clock: &'static CardClock) {
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. The card's percent busy, ms idle behind us and ms we stood
+/// waiting for it (for the overlay).
+fn card_clock_line(frames: f64, ms: f64) -> [f64; 3] {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
-        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
+        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {busy:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
-         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms"
     );
+    [busy, behind, stood]
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -482,9 +484,9 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
-fn private_bytes() -> u64 {
+/// The process's private bytes (diagnostics around the making of lists,
+/// and the overlay).
+pub(crate) fn private_bytes() -> u64 {
     process_memory().1
 }
 
@@ -6832,6 +6834,9 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// The overlay's pixels for `copy` (first), then for each of `ahead`:
+    /// one per list, so a present in the air keeps its own.
+    panels: Vec<Option<crate::overlay::Panel>>,
     hwnd: HWND,
     meter: Meter,
 }
@@ -6978,7 +6983,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
-        card_clock_line(frames, ms);
+        let [card_busy, idle_behind, stood] = card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -7087,6 +7092,30 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        crate::overlay::update(crate::overlay::Stats {
+            fps,
+            ms,
+            preparing: cpu,
+            copy_ms,
+            copy_mb,
+            texture_ms,
+            texture_mb,
+            gpu,
+            back_ms,
+            back_mb,
+            heap_pass_ms: picked_ms,
+            draws,
+            dropped,
+            indirect,
+            card_busy,
+            idle_behind,
+            stood,
+            making: crate::pipeline::making() as u64,
+            #[cfg(feature = "diagnostics")]
+            drops: drops.iter().map(|(why, n)| (why.clone(), *n as f64 / frames)).collect(),
+            #[cfg(not(feature = "diagnostics"))]
+            drops: Vec::new(),
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -7327,6 +7356,13 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            if crate::overlay::presented() {
+                let at = slot.map_or(0, |i| i + 1);
+                if p.panels.len() <= at {
+                    p.panels.resize_with(at + 1, || None);
+                }
+                crate::overlay::record(&self.device, list, &back, &mut p.panels[at], (width, height, format));
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -7449,6 +7485,7 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                panels: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
             })

@@ -583,11 +583,18 @@ pub(crate) fn pipeline(
 /// holds a worker (and a processor) the title's frames then lack.
 const SLOW_COMPILE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Logs the pipeline this thread made (its [`label`]) if `took` was slow.
+/// Logs the pipeline this thread made (its [`label`]) if `took` was slow,
+/// and counts it for the overlay.
 fn slow_compile(took: std::time::Duration) {
     if took >= SLOW_COMPILE {
+        use std::sync::atomic::Ordering::Relaxed;
         let label = LABEL.with(|l| l.borrow().clone());
         tracing::info!(seconds = took.as_secs_f64(), shaders = %label, "slow driver compile of a host pipeline");
+        let ms = took.as_millis() as u64;
+        crate::overlay::SLOW[0].fetch_add(1, Relaxed);
+        crate::overlay::SLOW[1].fetch_add(ms, Relaxed);
+        crate::overlay::SLOW[2].fetch_max(ms, Relaxed);
+        *crate::overlay::LAST_SLOW.lock().unwrap_or_else(|e| e.into_inner()) = label;
     }
 }
 

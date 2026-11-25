@@ -200,7 +200,18 @@ info and above).
 
 ## Debugging
 
-A release build has no debugging aids. Build them in with
+Every build has an on-screen panel of where the frame goes, shown from the
+start: F3 hides or shows it (`VICTORY_OVERLAY=0` starts with it hidden). Once a second it
+shows frames per second and ms per frame; preparing (title memory copies,
+texture refreshes), GPU and copy-back ms with the largest named the
+bottleneck; how busy the card was and how long it stood idle behind us;
+draws, draws dropped (and why, in a diagnostics build), pipelines being made
+and the driver's slow compiles; textures picked by index still waiting;
+process and video memory; and a bar per frame for the last frames' times
+(green to 34 ms, yellow to 100 ms, red above; a grey line at 33 ms). It is
+copied onto the window's image, not into saved frames.
+
+A release build has no other debugging aids. Build them in with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
