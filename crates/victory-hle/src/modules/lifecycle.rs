@@ -198,6 +198,10 @@ extern "system" fn window_proc(
             super::gameinput::cursor::click();
         }
         wm::WM_KILLFOCUS => super::gameinput::cursor::release(),
+        // Sizing or moving the window: the cursor is the user's until the
+        // loop ends (a clip following a shrinking client area collapses it).
+        wm::WM_ENTERSIZEMOVE => super::gameinput::cursor::size_move(true),
+        wm::WM_EXITSIZEMOVE => super::gameinput::cursor::size_move(false),
         _ => {}
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
