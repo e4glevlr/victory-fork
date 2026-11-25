@@ -2673,11 +2673,15 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back. A submission sent ahead may still
+        // be writing it, so the range is told to the list: nothing of ours
+        // reads it before that submission has run (`host::late_blocked`).
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            let len = len.min(self.left(address));
+            list.defer_placed_write(address as usize, len as usize);
             return;
         }
         let len = len.min(self.left(address));
