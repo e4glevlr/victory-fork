@@ -5119,7 +5119,9 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                let all_had_card = flights.iter().all(|f| f.card.is_some() || f.back.is_empty());
+                let all_had_card = flights
+                    .iter()
+                    .all(|f| f.card.is_some() || f.back.iter().all(|(s, _)| s.carded()));
                 self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
@@ -5559,7 +5561,7 @@ impl Host {
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
                         plans.push(card);
-                    } else if !flight.back.is_empty() {
+                    } else if flight.back.iter().any(|(s, _)| !s.carded()) {
                         all_had_card = false;
                     }
                     for (shadow, ranges) in &flight.back {
