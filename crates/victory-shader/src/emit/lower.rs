@@ -1897,7 +1897,8 @@ impl<'a> Lower<'a> {
             jump_loops: Vec::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
-            helper_scalars: x.native.stage == HwStage::Ps
+            helper_scalars: super::helper_own()
+                && x.native.stage == HwStage::Ps
                 && p.blocks
                     .iter()
                     .any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
@@ -5177,7 +5178,7 @@ impl<'a> Lower<'a> {
     /// helper lane computes only feeds derivatives, and its stores are
     /// dropped.
     fn helper_reads_own(&mut self, own: V, first: V) -> V {
-        if !self.s.pixel {
+        if !self.s.pixel || !super::helper_own() {
             return first;
         }
         let c = self.cur;
