@@ -212,8 +212,9 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_FILE=<file>` | presses each key (`Enter`, or `Enter 0.5` to hold it half a second) appended to the file as a line, in order and 0.6 s apart (the title's menus ignore quicker presses), focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`); a file named `now` put in the folder saves the next frame |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
@@ -228,6 +229,26 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+### Unattended runs
+
+`scripts\bench.ps1` runs the title with the diagnostics build, presses
+through the start screens into the saved game, measures a window of world
+frames and writes `summary.md` and `summary.json` beside the log and a frame
+every 20 seconds (under `<cache_dir>\bench\`). Each run starts from a copy of
+the data folder, so runs load the same checkpoint and do not overwrite each
+other's saves; the shader and pipeline caches are shared, so the first run of
+a build compiles and later runs measure.
+
+```powershell
+.\scripts\bench.ps1 -FirstBoot -Label seed -Seconds 60   # no saves yet: makes one
+.\scripts\bench.ps1 -Seed <seed run folder>\data -Label baseline
+.\scripts\bench.ps1 -Seed <seed run folder>\data -Label relay-off -Switches @{ VICTORY_RELAY = '0' }
+.\scripts\bench.ps1 -Compare <run folder>,<run folder>    # a table of medians
+```
+
+`Get-Help .\scripts\bench.ps1 -Full` lists the options (`-Seconds`,
+`-Warmup`, `-SkipCutscenes`, `-CaptureEvery`, `-Build`, ...).
 
 ## License
 
