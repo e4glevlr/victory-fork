@@ -992,6 +992,10 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(test, windows, feature = "diagnostics"))]
+#[path = "descriptor/texture_budget_test.rs"]
+mod texture_budget_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
