@@ -345,7 +345,11 @@ fn run(
     );
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
-        assert_eq!((u.root, u.slot), (RootType::Table, 0), "user data {u:?}");
+        // The group base of a one-dimensional dispatch: this one starts at
+        // group 0.
+        if u.root != RootType::Other(super::USER_GROUP_BASE) {
+            assert_eq!((u.root, u.slot), (RootType::Table, 0), "user data {u:?}");
+        }
         ud[u.index as usize] = 0;
     }
     let views = [

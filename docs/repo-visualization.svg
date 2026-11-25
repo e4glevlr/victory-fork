@@ -1,0 +1,395 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="840" viewBox="0 0 1200 840" role="img" aria-label="VIctory Fork Playable Progress and Architecture Telemetry">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1019"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="heroBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#111c2d"/>
+      <stop offset="55%" stop-color="#151b2c"/>
+      <stop offset="100%" stop-color="#131f2e"/>
+    </linearGradient>
+    <linearGradient id="accentBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="playableArc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="55%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="gpuNode" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0c2438"/>
+      <stop offset="100%" stop-color="#132035"/>
+    </linearGradient>
+    <linearGradient id="shaderNode" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#21183a"/>
+      <stop offset="100%" stop-color="#181c34"/>
+    </linearGradient>
+    <pattern id="dotGrid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1.5" cy="1.5" r="0.9" fill="#30363d" opacity="0.35"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#58a6ff"/>
+    </marker>
+    <style>
+      .sans { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+      .sec  { font-size: 11px; font-weight: 700; letter-spacing: 0.9px; fill: #58a6ff; }
+      .muted { fill: #8b949e; }
+      .text { fill: #e6edf3; }
+      .sub { fill: #c9d1d9; }
+    </style>
+  </defs>
+  <rect x="0.5" y="0.5" width="1199" height="839" rx="16" fill="url(#bgGrad)" stroke="#30363d"/>
+  <rect x="1" y="1" width="1198" height="838" rx="16" fill="url(#dotGrid)"/>
+  <rect x="24" y="1" width="1152" height="3" rx="1.5" fill="url(#accentBar)"/>
+  <g class="sans">
+    <circle cx="34" cy="39" r="6" fill="#34d399"/>
+    <circle cx="34" cy="39" r="10" fill="#34d399" opacity="0.18"/>
+    <text x="52" y="45" font-size="21" font-weight="700" class="text">VIctory Fork · Playable Progress &amp; Telemetry</text>
+    <text x="52" y="66" font-size="12.5" class="muted">Xbox Series → Windows D3D12 Compatibility Layer · Auto-updated on every commit</text>
+  </g>
+  <g>
+    <rect x="620" y="22" width="168" height="48" rx="9" fill="#161b22" stroke="#30363d"/>
+    <text x="630" y="39" font-size="9.5" font-weight="700" letter-spacing="0.7" class="sans muted">BRANCH</text>
+    <text x="630" y="59" font-size="13" font-weight="700" fill="#58a6ff" class="mono">claude/shader-prs</text>
+  </g>
+  <g>
+    <rect x="796" y="22" width="88" height="48" rx="9" fill="#161b22" stroke="#30363d"/>
+    <text x="806" y="39" font-size="9.5" font-weight="700" letter-spacing="0.7" class="sans muted">COMMITS</text>
+    <text x="806" y="59" font-size="13" font-weight="700" fill="#e6edf3" class="mono">353</text>
+  </g>
+  <g>
+    <rect x="892" y="22" width="88" height="48" rx="9" fill="#161b22" stroke="#30363d"/>
+    <text x="902" y="39" font-size="9.5" font-weight="700" letter-spacing="0.7" class="sans muted">RUST LOC</text>
+    <text x="902" y="59" font-size="13" font-weight="700" fill="#38bdf8" class="mono">168.9k</text>
+  </g>
+  <g>
+    <rect x="988" y="22" width="88" height="48" rx="9" fill="#161b22" stroke="#30363d"/>
+    <text x="998" y="39" font-size="9.5" font-weight="700" letter-spacing="0.7" class="sans muted">TESTS</text>
+    <text x="998" y="59" font-size="13" font-weight="700" fill="#34d399" class="mono">1,058</text>
+  </g>
+  <g>
+    <rect x="1084" y="22" width="92" height="48" rx="9" fill="#161b22" stroke="#30363d"/>
+    <text x="1094" y="39" font-size="9.5" font-weight="700" letter-spacing="0.7" class="sans muted">UPDATED</text>
+    <text x="1094" y="59" font-size="13" font-weight="700" fill="#c9d1d9" class="mono">2026-11-25</text>
+  </g>
+  <rect x="24" y="88" width="1152" height="184" rx="14" fill="url(#heroBg)" stroke="#38bdf8" stroke-opacity="0.55" stroke-width="1.2"/>
+  <rect x="24" y="88" width="1152" height="184" rx="14" fill="none" stroke="#a78bfa" stroke-opacity="0.2" stroke-width="4"/>
+  <g>
+    <circle cx="108" cy="180" r="68" fill="#0d1117" stroke="#21262d" stroke-width="1"/>
+    <circle cx="108" cy="180" r="58" fill="none" stroke="#1f2937" stroke-width="11"/>
+    <circle cx="108" cy="180" r="58" fill="none" stroke="url(#playableArc)" stroke-width="11" stroke-linecap="round" stroke-dasharray="239.0 364.4" transform="rotate(-90 108 180)"/>
+    <text x="108" y="182" text-anchor="middle" font-size="28" font-weight="800" fill="#f0f6fc" class="mono">65.6%</text>
+    <text x="108" y="201" text-anchor="middle" font-size="9.5" font-weight="700" letter-spacing="1.2" fill="#34d399" class="sans">TO PLAYABLE</text>
+    <text x="108" y="216" text-anchor="middle" font-size="9" class="mono muted">-34.4% left</text>
+  </g>
+  <g>
+    <text x="196" y="114" class="sans sec">PLAYABLE READINESS INDEX · MAIN GOAL</text>
+    <text x="196" y="140" font-size="16.5" font-weight="700" class="sans text">In-World Renders · Lighting &amp; 30 FPS Next</text>
+    <text x="196" y="160" font-size="11.5" class="sans muted">Weighted score: Clean lit visuals (P1) + stable 30 FPS (P2)</text>
+
+    <rect x="196" y="172" width="128" height="24" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="260" y="188" text-anchor="middle" font-size="10.5" font-weight="700" fill="#38bdf8" class="mono">Now: 9.6 / 30 FPS</text>
+
+    <rect x="332" y="172" width="176" height="24" rx="6" fill="#2a161b" stroke="#f87171" stroke-opacity="0.55"/>
+    <text x="420" y="188" text-anchor="middle" font-size="10.5" font-weight="700" fill="#fca5a5" class="mono">Top Blocker: RT Lighting</text>
+  </g>
+  <g>
+    <line x1="210" y1="224" x2="494" y2="224" stroke="#30363d" stroke-width="2.5"/>
+    <line x1="210" y1="224" x2="423" y2="224" stroke="#38bdf8" stroke-width="2.5"/>
+    <circle cx="210" cy="224" r="6" fill="#34d399"/>
+    <circle cx="281" cy="224" r="6" fill="#34d399"/>
+    <circle cx="352" cy="224" r="6" fill="#34d399"/>
+    <circle cx="423" cy="224" r="7.5" fill="#0d1117" stroke="#38bdf8" stroke-width="3"/>
+    <circle cx="494" cy="224" r="6" fill="#1f2937" stroke="#64748b" stroke-width="1.5"/>
+    <text x="210" y="246" text-anchor="middle" font-size="9.5" class="sans muted">Boot</text>
+    <text x="281" y="246" text-anchor="middle" font-size="9.5" class="sans muted">Menus</text>
+    <text x="352" y="246" text-anchor="middle" font-size="9.5" class="sans muted">Cutscene</text>
+    <text x="423" y="246" text-anchor="middle" font-size="9.5" font-weight="700" fill="#38bdf8" class="sans">In-World</text>
+    <text x="494" y="246" text-anchor="middle" font-size="9.5" class="sans muted">Playable</text>
+  </g>
+  <line x1="530" y1="106" x2="530" y2="254" stroke="#263244"/>
+  <g>
+    <rect x="548" y="104" width="296" height="46" rx="8" fill="#0d1117" fill-opacity="0.72" stroke="#263244"/>
+    <text x="559" y="120" font-size="10.5" font-weight="600" class="sans sub">Boot, Menus, Saves &amp; Cutscene</text>
+    <text x="833" y="120" text-anchor="end" font-size="10.5" font-weight="700" fill="#34d399" class="mono">100%</text>
+    <rect x="559" y="126" width="274" height="6" rx="3" fill="#21262d"/>
+    <rect x="559" y="126" width="274.0" height="6" rx="3" fill="#34d399"/>
+    <text x="559" y="143" font-size="9.5" class="sans muted">30 fps menus · saves ok</text>
+    <text x="833" y="143" text-anchor="end" font-size="9" class="mono muted">w:15%</text>
+  </g>
+  <g>
+    <rect x="858" y="104" width="296" height="46" rx="8" fill="#0d1117" fill-opacity="0.72" stroke="#263244"/>
+    <text x="869" y="120" font-size="10.5" font-weight="600" class="sans sub">Shader Pack (SM 6.6 / Wave32)</text>
+    <text x="1143" y="120" text-anchor="end" font-size="10.5" font-weight="700" fill="#34d399" class="mono">99%</text>
+    <rect x="869" y="126" width="274" height="6" rx="3" fill="#21262d"/>
+    <rect x="869" y="126" width="271.1" height="6" rx="3" fill="#34d399"/>
+    <text x="869" y="143" font-size="9.5" class="sans muted">99.0% validated</text>
+    <text x="1143" y="143" text-anchor="end" font-size="9" class="mono muted">w:20%</text>
+  </g>
+  <g>
+    <rect x="548" y="158" width="296" height="46" rx="8" fill="#0d1117" fill-opacity="0.72" stroke="#263244"/>
+    <text x="559" y="174" font-size="10.5" font-weight="600" class="sans sub">World Geometry &amp; Scene Fidelity</text>
+    <text x="833" y="174" text-anchor="end" font-size="10.5" font-weight="700" fill="#38bdf8" class="mono">75%</text>
+    <rect x="559" y="180" width="274" height="6" rx="3" fill="#21262d"/>
+    <rect x="559" y="180" width="205.5" height="6" rx="3" fill="#38bdf8"/>
+    <text x="559" y="197" font-size="9.5" class="sans muted">First rooms ok · streaming WIP</text>
+    <text x="833" y="197" text-anchor="end" font-size="9" class="mono muted">w:20%</text>
+  </g>
+  <g>
+    <rect x="858" y="158" width="296" height="46" rx="8" fill="#0d1117" fill-opacity="0.72" stroke="#263244"/>
+    <text x="869" y="174" font-size="10.5" font-weight="600" class="sans sub">Lighting &amp; RT Shadows (P1)</text>
+    <text x="1143" y="174" text-anchor="end" font-size="10.5" font-weight="700" fill="#f87171" class="mono">25%</text>
+    <rect x="869" y="180" width="274" height="6" rx="3" fill="#21262d"/>
+    <rect x="869" y="180" width="68.5" height="6" rx="3" fill="#f87171"/>
+    <text x="869" y="197" font-size="9.5" class="sans muted">Blocker: shadow light off</text>
+    <text x="1143" y="197" text-anchor="end" font-size="9" class="mono muted">w:20%</text>
+  </g>
+  <g>
+    <rect x="548" y="212" width="296" height="46" rx="8" fill="#0d1117" fill-opacity="0.72" stroke="#263244"/>
+    <text x="559" y="228" font-size="10.5" font-weight="600" class="sans sub">Playable Frame Rate (30 FPS)</text>
+    <text x="833" y="228" text-anchor="end" font-size="10.5" font-weight="700" fill="#fbbf24" class="mono">32%</text>
+    <rect x="559" y="234" width="274" height="6" rx="3" fill="#21262d"/>
+    <rect x="559" y="234" width="87.7" height="6" rx="3" fill="#fbbf24"/>
+    <text x="559" y="251" font-size="9.5" class="sans muted">9.6 / 30 FPS</text>
+    <text x="833" y="251" text-anchor="end" font-size="9" class="mono muted">w:15%</text>
+  </g>
+  <g>
+    <rect x="858" y="212" width="296" height="46" rx="8" fill="#0d1117" fill-opacity="0.72" stroke="#263244"/>
+    <text x="869" y="228" font-size="10.5" font-weight="600" class="sans sub">Stability &amp; 8–12 GB VRAM</text>
+    <text x="1143" y="228" text-anchor="end" font-size="10.5" font-weight="700" fill="#38bdf8" class="mono">60%</text>
+    <rect x="869" y="234" width="274" height="6" rx="3" fill="#21262d"/>
+    <rect x="869" y="234" width="164.4" height="6" rx="3" fill="#38bdf8"/>
+    <text x="869" y="251" font-size="9.5" class="sans muted">No room TDR · open-world WIP</text>
+    <text x="1143" y="251" text-anchor="end" font-size="9" class="mono muted">w:10%</text>
+  </g>
+  <rect x="24" y="288" width="696" height="244" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="42" y="313" class="sans sec">RUNTIME ARCHITECTURE &amp; PIPELINE FLOW</text>
+  <text x="702" y="313" text-anchor="end" font-size="11" class="mono muted">GPU + Shader = 75.1% of codebase</text>
+  <g>
+    <rect x="42" y="328" width="178" height="54" rx="8" fill="#0f172a" stroke="#30363d"/>
+    <rect x="42" y="328" width="4" height="54" rx="2" fill="#f472b6"/>
+    <text x="54" y="350" font-size="12" font-weight="700" class="mono text">apps/victory</text>
+    <text x="210" y="350" text-anchor="end" font-size="10.5" fill="#f472b6" class="mono">2.7k</text>
+    <text x="54" y="369" font-size="10.5" class="sans muted">CLI runner &amp; warm-up</text>
+  </g>
+  <g>
+    <rect x="42" y="396" width="178" height="54" rx="8" fill="#0f172a" stroke="#30363d"/>
+    <rect x="42" y="396" width="4" height="54" rx="2" fill="#60a5fa"/>
+    <text x="54" y="418" font-size="12" font-weight="700" class="mono text">victory-loader</text>
+    <text x="210" y="418" text-anchor="end" font-size="10.5" fill="#60a5fa" class="mono">5.0k</text>
+    <text x="54" y="437" font-size="10.5" class="sans muted">PE map, TLS, crash log</text>
+  </g>
+  <g>
+    <rect x="42" y="464" width="178" height="54" rx="8" fill="#0f172a" stroke="#30363d"/>
+    <rect x="42" y="464" width="4" height="54" rx="2" fill="#fb923c"/>
+    <text x="54" y="486" font-size="12" font-weight="700" class="mono text">victory-pe</text>
+    <text x="210" y="486" text-anchor="end" font-size="10.5" fill="#fb923c" class="mono">1.6k</text>
+    <text x="54" y="505" font-size="10.5" class="sans muted">PE32+ &amp; import census</text>
+  </g>
+  <g>
+    <rect x="254" y="328" width="194" height="54" rx="8" fill="#0f172a" stroke="#30363d"/>
+    <rect x="254" y="328" width="4" height="54" rx="2" fill="#34d399"/>
+    <text x="266" y="350" font-size="12" font-weight="700" class="mono text">victory-hle</text>
+    <text x="438" y="350" text-anchor="end" font-size="10.5" fill="#34d399" class="mono">24.3k</text>
+    <text x="266" y="369" font-size="10.5" class="sans muted">Console APIs &amp; Win32 HLE</text>
+  </g>
+  <g>
+    <rect x="254" y="396" width="194" height="54" rx="8" fill="#0f172a" stroke="#30363d"/>
+    <rect x="254" y="396" width="4" height="54" rx="2" fill="#fbbf24"/>
+    <text x="266" y="418" font-size="12" font-weight="700" class="mono text">victory-formats</text>
+    <text x="438" y="418" text-anchor="end" font-size="10.5" fill="#fbbf24" class="mono">5.5k</text>
+    <text x="266" y="437" font-size="10.5" class="sans muted">Detile, BCPack, XMA/Opus</text>
+  </g>
+  <g>
+    <rect x="254" y="464" width="194" height="54" rx="8" fill="#0f172a" stroke="#30363d"/>
+    <rect x="254" y="464" width="4" height="54" rx="2" fill="#94a3b8"/>
+    <text x="266" y="486" font-size="12" font-weight="700" class="mono text">core / pipe / game</text>
+    <text x="438" y="486" text-anchor="end" font-size="10.5" fill="#94a3b8" class="mono">2.9k</text>
+    <text x="266" y="505" font-size="10.5" class="sans muted">Config, cache, policy</text>
+  </g>
+  <g>
+    <rect x="482" y="328" width="220" height="84" rx="10" fill="url(#gpuNode)" stroke="#38bdf8" stroke-width="1.3"/>
+    <text x="496" y="350" font-size="13.5" font-weight="700" fill="#7dd3fc" class="mono">victory-gpu</text>
+    <text x="688" y="350" text-anchor="end" font-size="11" font-weight="700" fill="#38bdf8" class="mono">67.5k LOC</text>
+    <text x="496" y="370" font-size="11.5" class="sans sub">D3D12.X → Host D3D12</text>
+    <text x="496" y="388" font-size="10.5" class="sans muted">Sync, heaps, textures, draws</text>
+    <text x="496" y="403" font-size="10" fill="#38bdf8" class="mono">Host GPU · Wave32 / SM 6.6</text>
+  </g>
+  <g>
+    <rect x="482" y="434" width="220" height="84" rx="10" fill="url(#shaderNode)" stroke="#a78bfa" stroke-width="1.3"/>
+    <text x="496" y="456" font-size="13.5" font-weight="700" fill="#c4b5fd" class="mono">victory-shader</text>
+    <text x="688" y="456" text-anchor="end" font-size="11" font-weight="700" fill="#a78bfa" class="mono">59.4k LOC</text>
+    <text x="496" y="476" font-size="11.5" class="sans sub">RDNA → SSA → DXIL</text>
+    <text x="496" y="494" font-size="10.5" class="sans muted">Wave64 pairs, mesh linking</text>
+    <text x="496" y="509" font-size="10" fill="#a78bfa" class="mono">Source-keyed disk cache</text>
+  </g>
+  <g fill="none" stroke="#58a6ff" stroke-width="1.5" opacity="0.85">
+    <line x1="131" y1="382" x2="131" y2="393" marker-end="url(#arrow)"/>
+    <line x1="131" y1="463" x2="131" y2="453" marker-end="url(#arrow)"/>
+    <path d="M 220 420 L 236 420 L 236 355 L 251 355" marker-end="url(#arrow)"/>
+    <line x1="448" y1="355" x2="479" y2="355" marker-end="url(#arrow)"/>
+    <path d="M 448 423 L 465 423 L 465 385 L 479 385" marker-end="url(#arrow)"/>
+    <line x1="592" y1="412" x2="592" y2="431" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  </g>
+  <rect x="736" y="288" width="440" height="244" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="754" y="313" class="sans sec">CODEBASE FOOTPRINT BY CRATE</text>
+  <text x="1158" y="313" text-anchor="end" font-size="11" class="mono muted">11 crates · 190 .rs files</text>
+  <g>
+    <text x="754" y="346" font-size="11.5" class="mono sub">victory-gpu</text>
+    <rect x="876" y="336" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="336" width="184.0" height="12" rx="6" fill="#38bdf8"/>
+    <text x="1158" y="346" text-anchor="end" font-size="11" class="mono muted">67.5k (40%)</text>
+  </g>
+  <g>
+    <text x="754" y="373" font-size="11.5" class="mono sub">victory-shader</text>
+    <rect x="876" y="363" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="363" width="161.8" height="12" rx="6" fill="#a78bfa"/>
+    <text x="1158" y="373" text-anchor="end" font-size="11" class="mono muted">59.4k (35%)</text>
+  </g>
+  <g>
+    <text x="754" y="400" font-size="11.5" class="mono sub">victory-hle</text>
+    <rect x="876" y="390" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="390" width="66.2" height="12" rx="6" fill="#34d399"/>
+    <text x="1158" y="400" text-anchor="end" font-size="11" class="mono muted">24.3k (14%)</text>
+  </g>
+  <g>
+    <text x="754" y="427" font-size="11.5" class="mono sub">victory-formats</text>
+    <rect x="876" y="417" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="417" width="14.9" height="12" rx="6" fill="#fbbf24"/>
+    <text x="1158" y="427" text-anchor="end" font-size="11" class="mono muted">5.5k (3%)</text>
+  </g>
+  <g>
+    <text x="754" y="454" font-size="11.5" class="mono sub">victory-loader</text>
+    <rect x="876" y="444" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="444" width="13.5" height="12" rx="6" fill="#60a5fa"/>
+    <text x="1158" y="454" text-anchor="end" font-size="11" class="mono muted">5.0k (3%)</text>
+  </g>
+  <g>
+    <text x="754" y="481" font-size="11.5" class="mono sub">apps/victory</text>
+    <rect x="876" y="471" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="471" width="7.3" height="12" rx="6" fill="#f472b6"/>
+    <text x="1158" y="481" text-anchor="end" font-size="11" class="mono muted">2.7k (2%)</text>
+  </g>
+  <g>
+    <text x="754" y="508" font-size="11.5" class="mono sub">other (5)</text>
+    <rect x="876" y="498" width="184" height="12" rx="6" fill="#21262d"/>
+    <rect x="876" y="498" width="12.5" height="12" rx="6" fill="#64748b"/>
+    <text x="1158" y="508" text-anchor="end" font-size="11" class="mono muted">4.6k (3%)</text>
+  </g>
+  <rect x="24" y="548" width="636" height="256" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="42" y="573" class="sans sec">RECENT COMMIT FOCUS &amp; STREAM</text>
+  <text x="642" y="573" text-anchor="end" font-size="11" class="mono muted">Last 60 commits</text>
+  <rect x="42" y="586" width="600" height="14" rx="7" fill="#21262d"/>
+  <clipPath id="focusClip"><rect x="42" y="586" width="600" height="14" rx="7"/></clipPath>
+  <g clip-path="url(#focusClip)">
+    <rect x="42.0" y="586" width="330.5" height="14" fill="#a78bfa"/>
+    <rect x="372.0" y="586" width="200.5" height="14" fill="#38bdf8"/>
+    <rect x="572.0" y="586" width="20.5" height="14" fill="#34d399"/>
+    <rect x="592.0" y="586" width="10.5" height="14" fill="#fbbf24"/>
+    <rect x="602.0" y="586" width="40.5" height="14" fill="#94a3b8"/>
+  </g>
+  <circle cx="46" cy="616" r="4" fill="#a78bfa"/>
+  <text x="54" y="620" font-size="10.5" class="sans muted">Shaders 55%</text>
+  <circle cx="166" cy="616" r="4" fill="#38bdf8"/>
+  <text x="174" y="620" font-size="10.5" class="sans muted">GPU / D3D12 33%</text>
+  <circle cx="286" cy="616" r="4" fill="#34d399"/>
+  <text x="294" y="620" font-size="10.5" class="sans muted">HLE / Loader 3%</text>
+  <circle cx="406" cy="616" r="4" fill="#fbbf24"/>
+  <text x="414" y="620" font-size="10.5" class="sans muted">Formats / Core 2%</text>
+  <circle cx="526" cy="616" r="4" fill="#94a3b8"/>
+  <text x="534" y="620" font-size="10.5" class="sans muted">Docs / Maint 7%</text>
+  <line x1="42" y1="632" x2="642" y2="632" stroke="#21262d"/>
+  <g>
+    <circle cx="48" cy="653" r="3.5" fill="#a78bfa"/>
+    <text x="60" y="657" font-size="11" fill="#58a6ff" class="mono">08289b9d</text>
+    <text x="122" y="657" font-size="10.5" class="mono muted">11-25</text>
+    <text x="166" y="657" font-size="11.5" class="sans sub">Shaders: VICTORY_EXACT_F64_SUMS=1 refuses the paired form&apos;s 64-…</text>
+  </g>
+  <g>
+    <circle cx="48" cy="682" r="3.5" fill="#a78bfa"/>
+    <text x="60" y="686" font-size="11" fill="#58a6ff" class="mono">d556a20c</text>
+    <text x="122" y="686" font-size="10.5" class="mono muted">11-25</text>
+    <text x="166" y="686" font-size="11.5" class="sans sub">Shaders: a mesh program over 32 KiB drawn without a pixel progr…</text>
+  </g>
+  <g>
+    <circle cx="48" cy="711" r="3.5" fill="#a78bfa"/>
+    <text x="60" y="715" font-size="11" fill="#58a6ff" class="mono">0cb6b7b6</text>
+    <text x="122" y="715" font-size="10.5" class="mono muted">11-25</text>
+    <text x="166" y="715" font-size="11.5" class="sans sub">Shaders: wave64 programs that only allocate with their wave val…</text>
+  </g>
+  <g>
+    <circle cx="48" cy="740" r="3.5" fill="#a78bfa"/>
+    <text x="60" y="744" font-size="11" fill="#58a6ff" class="mono">27d252c1</text>
+    <text x="122" y="744" font-size="10.5" class="mono muted">11-25</text>
+    <text x="166" y="744" font-size="11.5" class="sans sub">Shaders: the paired form reads a guarded write without its sele…</text>
+  </g>
+  <g>
+    <circle cx="48" cy="769" r="3.5" fill="#a78bfa"/>
+    <text x="60" y="773" font-size="11" fill="#58a6ff" class="mono">f197fa1b</text>
+    <text x="122" y="773" font-size="10.5" class="mono muted">11-25</text>
+    <text x="166" y="773" font-size="11.5" class="sans sub">Shaders: the census names the form a wave64 compute program tak…</text>
+  </g>
+  <rect x="676" y="548" width="500" height="256" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="694" y="573" class="sans sec">SHADER COVERAGE (SM 6.6 · WAVE32) &amp; TELEMETRY</text>
+  <g>
+    <text x="694" y="601" font-size="11.5" font-weight="500" class="sans sub">Pixel</text>
+    <rect x="776" y="592" width="228" height="10" rx="5" fill="#21262d"/>
+    <rect x="776" y="592" width="228.0" height="10" rx="5" fill="#34d399"/>
+    <text x="1158" y="601" text-anchor="end" font-size="10.5" class="mono muted">12,067/12,067 (100.0%)</text>
+  </g>
+  <g>
+    <text x="694" y="627" font-size="11.5" font-weight="500" class="sans sub">Vertex</text>
+    <rect x="776" y="618" width="228" height="10" rx="5" fill="#21262d"/>
+    <rect x="776" y="618" width="228.0" height="10" rx="5" fill="#34d399"/>
+    <text x="1158" y="627" text-anchor="end" font-size="10.5" class="mono muted">2,192/2,192 (100.0%)</text>
+  </g>
+  <g>
+    <text x="694" y="653" font-size="11.5" font-weight="500" class="sans sub">Compute</text>
+    <rect x="776" y="644" width="228" height="10" rx="5" fill="#21262d"/>
+    <rect x="776" y="644" width="227.6" height="10" rx="5" fill="#38bdf8"/>
+    <text x="1158" y="653" text-anchor="end" font-size="10.5" class="mono muted">2,729/2,734 (99.8%)</text>
+  </g>
+  <g>
+    <text x="694" y="679" font-size="11.5" font-weight="500" class="sans sub">Mesh</text>
+    <rect x="776" y="670" width="228" height="10" rx="5" fill="#21262d"/>
+    <rect x="776" y="670" width="226.2" height="10" rx="5" fill="#a78bfa"/>
+    <text x="1158" y="679" text-anchor="end" font-size="10.5" class="mono muted">8,694/8,765 (99.2%)</text>
+  </g>
+  <g>
+    <text x="694" y="705" font-size="11.5" font-weight="700" class="sans sub">Total Pack</text>
+    <rect x="776" y="696" width="228" height="10" rx="5" fill="#21262d"/>
+    <rect x="776" y="696" width="225.6" height="10" rx="5" fill="#58a6ff"/>
+    <text x="1158" y="705" text-anchor="end" font-size="10.5" class="mono muted">25,682/25,953 (99.0%)</text>
+  </g>
+  <line x1="694" y1="726" x2="1158" y2="726" stroke="#21262d"/>
+  <g>
+    <rect x="694" y="738" width="109" height="54" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="704" y="754" font-size="9" font-weight="700" letter-spacing="0.6" class="sans muted">VICTORY_*</text>
+    <text x="704" y="773" font-size="14" font-weight="700" fill="#38bdf8" class="mono">279</text>
+    <text x="704" y="786" font-size="9.5" class="sans muted">switches</text>
+  </g>
+  <g>
+    <rect x="812" y="738" width="109" height="54" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="822" y="754" font-size="9" font-weight="700" letter-spacing="0.6" class="sans muted">UNIT TESTS</text>
+    <text x="822" y="773" font-size="14" font-weight="700" fill="#34d399" class="mono">1,058</text>
+    <text x="822" y="786" font-size="9.5" class="sans muted">in workspace</text>
+  </g>
+  <g>
+    <rect x="930" y="738" width="109" height="54" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="940" y="754" font-size="9" font-weight="700" letter-spacing="0.6" class="sans muted">CRATES</text>
+    <text x="940" y="773" font-size="14" font-weight="700" fill="#a78bfa" class="mono">11</text>
+    <text x="940" y="786" font-size="9.5" class="sans muted">modular</text>
+  </g>
+  <g>
+    <rect x="1048" y="738" width="109" height="54" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="1058" y="754" font-size="9" font-weight="700" letter-spacing="0.6" class="sans muted">ASSET POLICY</text>
+    <text x="1058" y="773" font-size="14" font-weight="700" fill="#3fb950" class="mono">TEXT-ONLY</text>
+    <text x="1058" y="786" font-size="9.5" class="sans muted">zero assets</text>
+  </g>
+  <text x="28" y="825" font-size="10.5" class="mono muted">Auto-generated by cargo xtask viz (.githooks/pre-commit) · Rule #1 Asset-Policy Compliant</text>
+  <text x="1172" y="825" text-anchor="end" font-size="10.5" class="mono muted">Priority: P0 Stability → P1 Visual Accuracy → P2 FPS</text>
+</svg>
