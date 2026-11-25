@@ -1545,6 +1545,7 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
+        s.coherent = wants_coherent(p);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
@@ -6587,6 +6588,23 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A fence over all device memory (`DeviceMemoryBarrier`: the global UAV
+    /// fence, no group sync) in a compute program with coherent views
+    /// ([`wants_coherent`]), at a buffer cache invalidation (before reads of
+    /// what another group wrote): the host orders a thread's accesses to
+    /// different addresses for other groups only at a fence. Elsewhere
+    /// nothing: a program without coherent views exchanges nothing with
+    /// other groups. (The waits for stores to land, `s_waitcnt_vscnt`, are
+    /// dropped with the other scheduling waits in `ir`, so get none.)
+    fn device_fence(&mut self) {
+        if !self.s.coherent || self.s.threads.is_none() || self.s.mesh.is_some() {
+            return;
+        }
+        let (mode, void) = (self.s.m.i32(2), self.s.t.void);
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -10275,7 +10293,9 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // The host has no console buffer cache to invalidate; what the
+            // invalidation orders is a fence there (`device_fence`).
+            self.device_fence();
             return Ok(());
         }
         if *lds || *tfe {
@@ -11420,6 +11440,39 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a program's UAVs are globally coherent. The console keeps
+/// memory coherent between the groups of a dispatch only where a program
+/// asks for it: cache-control bits (GLC, DLC, SLC) on a memory or scalar
+/// load or store, a memory atomic, or an explicit cache invalidation. A
+/// program that does none of these reads only what no other group of the
+/// dispatch writes, or writes only what none reads, so its views stay
+/// plain and the host may keep them in its first-level caches. One that
+/// does (the title's BVH builder: atomics, then reads of what other groups
+/// wrote) has every UAV globally coherent: the host then makes a group's
+/// accesses see other groups' writes, which a plain view need not.
+pub(crate) fn wants_coherent(p: &crate::ir::Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        let name = inst.name();
+        let bits = match &inst.fields {
+            Fields::Buffer { cache, .. }
+            | Fields::Image { cache, .. }
+            | Fields::Flat { cache, .. }
+            | Fields::Smem { cache, .. } => cache.glc || cache.dlc || cache.slc,
+            _ => false,
+        };
+        let atomic = name.contains("atomic")
+            && matches!(
+                inst.fields,
+                Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. }
+            );
+        let invalidate = matches!(
+            name,
+            "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv"
+        );
+        bits || atomic || invalidate
+    })
 }
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
