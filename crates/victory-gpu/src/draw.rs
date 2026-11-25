@@ -1651,7 +1651,7 @@ impl State {
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
+    pub(crate) fn heap_textures(
         &self,
         list: &HostList,
         heap: &crate::descriptor::Heap,
@@ -1839,7 +1839,8 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            if !room {
+            // Earlier slots can make new copies and exhaust the budget in this pass.
+            if !crate::resource::room() {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
