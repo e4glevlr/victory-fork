@@ -69,6 +69,18 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Number of critical-edge blocks recorded in `Lower::edges`.
+    #[cfg(test)]
+    pub edge_blocks: usize,
+    /// Number of mesh blocks with barriers suppressed (`Lower::no_barrier`).
+    #[cfg(test)]
+    pub no_barrier_blocks: usize,
+    /// Number of `waveReadLaneFirst.i32` ops emitted by `scalar_dynamic`.
+    #[cfg(test)]
+    pub scalar_wave_first: usize,
+    /// Number of raw UAV loads emitted by `smem`.
+    #[cfg(test)]
+    pub smem_raw_uavs: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -216,8 +228,13 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
-    /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    /// Blocks splitting the edge from one IR block to another (flag distinguishes
+    /// the second edge when a conditional branch targets the same block twice).
+    edges: HashMap<(usize, usize, bool), usize>,
+    #[cfg(test)]
+    scalar_wave_first: usize,
+    #[cfg(test)]
+    smem_raw_uavs: usize,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -1861,12 +1878,18 @@ impl<'a> Lower<'a> {
                 index[b] = n;
             }
             let idom = crate::ir::idoms(&p.blocks, &order, &index);
+            let all = all_lane_blocks(x.st);
             let alloc: Vec<usize> = (0..p.blocks.len())
                 .filter(|&b| {
-                    p.blocks[b].insts.iter().any(|i| {
-                        i.name() == "s_sendmsg"
-                            && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
-                    })
+                    // Only a divergent `GS_ALLOC_REQ` (one lane requesting) makes
+                    // dominated barriers unsafe; an all-lane `GS_ALLOC_REQ` in
+                    // block 0 or another uniform block must not strip every
+                    // `s_barrier` across the mesh shader.
+                    all.as_ref().is_none_or(|a| !a[b])
+                        && p.blocks[b].insts.iter().any(|i| {
+                            i.name() == "s_sendmsg"
+                                && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+                        })
                 })
                 .collect();
             for &b in &order {
@@ -1934,6 +1957,10 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
+            #[cfg(test)]
+            scalar_wave_first: 0,
+            #[cfg(test)]
+            smem_raw_uavs: 0,
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -2658,6 +2685,14 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            edge_blocks: self.edges.len(),
+            #[cfg(test)]
+            no_barrier_blocks: self.no_barrier.len(),
+            #[cfg(test)]
+            scalar_wave_first: self.scalar_wave_first,
+            #[cfg(test)]
+            smem_raw_uavs: self.smem_raw_uavs,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6020,8 +6055,13 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+            let uav = matches!(kind, Some(u) if u.kind == ResourceType::Uav);
+            #[cfg(test)]
+            if uav {
+                self.smem_raw_uavs += 1;
+            }
+            let h = self.handle(site, src, false, (if uav { 0x100b } else { 11 }, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -6249,8 +6289,10 @@ impl<'a> Lower<'a> {
                 (props, None)
             }
             // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
+            Fields::Smem { .. }
+                if used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) =>
+            {
+                ((11 | u, 0), None)
             }
             // A constant buffer: nothing of its descriptor is a number.
             Fields::Smem { .. } => {
@@ -6370,18 +6412,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(value) = a.dynamic {
-            let mut d = self.i32_of(value)?;
-            // A term held per lane reached the address through
-            // `v_readfirstlane_b32`: the first lane's.
-            let per_lane = self.def_block.get(&value).is_some_and(|&b| {
-                let writes = |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
-                self.x.p.blocks[b].insts.iter().any(writes)
-            });
-            if per_lane {
-                self.s.flags |= flags::WAVE_OPS;
-                let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
-            }
+            let d = self.scalar_dynamic(value)?;
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         for k in 0..count {
@@ -6541,13 +6572,54 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// Whether `value` is defined as a VGPR (program input, phi, or instruction
+    /// write), meaning it reached a scalar address via `v_readfirstlane_b32`.
+    fn is_vgpr_value(&self, value: Value) -> bool {
+        if self
+            .x
+            .p
+            .inputs
+            .iter()
+            .any(|&(r, v)| v == value && matches!(r, Reg::V(_)))
+        {
+            return true;
+        }
+        if let Some(&(b, i)) = self.phi_at.get(&value) {
+            return matches!(self.x.p.blocks[b].phis[i].reg, Reg::V(_));
+        }
+        self.def_block.get(&value).is_some_and(|&b| {
+            let writes =
+                |i: &Inst| i.writes.iter().any(|w| w.1 == value && matches!(w.0, Reg::V(_)));
+            self.x.p.blocks[b].insts.iter().any(writes)
+        })
+    }
+
+    /// Lowers a dynamic byte offset of a scalar address (`code_smem` or
+    /// `Source::Built`), restoring `waveReadLaneFirst.i32` whenever `resource`
+    /// unwrapped a `v_readfirstlane_b32` back to a VGPR value.
+    fn scalar_dynamic(&mut self, value: Value) -> Result<V, Why> {
+        let mut d = self.i32_of(value)?;
+        if self.is_vgpr_value(value) {
+            self.s.flags |= flags::WAVE_OPS;
+            #[cfg(test)]
+            {
+                self.scalar_wave_first += 1;
+            }
+            let i32t = self.s.t.i32;
+            d = self
+                .s
+                .op(self.cur, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+        }
+        Ok(d)
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
                 let mut x = match address.dynamic {
-                    Some(v) => Some(self.i32_of(v)?),
+                    Some(v) => Some(self.scalar_dynamic(v)?),
                     None => None,
                 };
                 if let Some(bias) = self.root_bias(address.param) {
@@ -6754,12 +6826,13 @@ impl<'a> Lower<'a> {
         const WHY: Why = "a descriptor chosen by control flow";
         let p = self.x.p;
         let mut incoming = Vec::new();
-        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+        for (n, (&q, arg)) in p.blocks[block].preds.iter().zip(args).enumerate() {
             if self.block[q].is_none() {
                 continue;
             }
             let tail = self.tail[q].ok_or(WHY)?;
-            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let second = p.blocks[block].preds[..n].contains(&q);
+            let at = self.edges.get(&(q, block, second)).copied().unwrap_or(tail);
             let index = match arg {
                 Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
@@ -6865,13 +6938,14 @@ impl<'a> Lower<'a> {
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                for (n, (&q, arg)) in self.x.p.blocks[*block].preds.iter().zip(args).enumerate() {
                     if self.block[q].is_none() {
                         continue;
                     }
                     let tail =
                         self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let second = self.x.p.blocks[*block].preds[..n].contains(&q);
+                    let at = self.edges.get(&(q, *block, second)).copied().unwrap_or(tail);
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
@@ -11390,7 +11464,8 @@ impl<'a> Lower<'a> {
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let t = self.edge(b, taken, false);
+                let f = self.edge(b, not_taken, taken == not_taken);
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
@@ -11484,7 +11559,9 @@ impl<'a> Lower<'a> {
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
-    fn edge(&mut self, from: usize, to: usize) -> usize {
+    /// `second` distinguishes the second edge when a conditional branch
+    /// targets the same block on both arms.
+    fn edge(&mut self, from: usize, to: usize, second: bool) -> usize {
         let target = self.block[to].expect("reachable");
         let preds = self.x.p.blocks[to]
             .preds
@@ -11497,7 +11574,7 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.m.new_block();
         self.s.m.terminate(e, Term::Br(target));
-        self.edges.insert((from, to), e);
+        self.edges.insert((from, to, second), e);
         e
     }
 
@@ -11517,7 +11594,8 @@ impl<'a> Lower<'a> {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let second = p.blocks[b].preds[..n].contains(&q);
+                let qb = self.edges.get(&(q, b, second)).copied().unwrap_or(qb);
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -11566,7 +11644,8 @@ impl<'a> Lower<'a> {
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let second = p.blocks[b].preds[..n].contains(&q);
+                let qb = self.edges.get(&(q, b, second)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
