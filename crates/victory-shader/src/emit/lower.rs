@@ -2055,7 +2055,9 @@ impl<'a> Lower<'a> {
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
             helper_scalars: x.native.stage == HwStage::Ps
-                && p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
+                && p.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
