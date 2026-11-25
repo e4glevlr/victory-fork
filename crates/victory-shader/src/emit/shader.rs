@@ -51,6 +51,21 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] for a shader lowered
+/// with `view_marks`: two dwords per view-heap slot `(base_bit, phase | stride<<16)`.
+/// `base_bit == VIEW_MARK_NONE` means the slot is untracked; otherwise a write
+/// at byte offset `x` of the view sets bit `base_bit + ((phase + x) >> 16)` in
+/// `u<SLOT_VIEW_WRITES>`.
+pub const SLOT_VIEW_MARKS: u8 = 252;
+/// Root UAV `u<SLOT_VIEW_WRITES>` in [`ROOT_CBV_SPACE`]: a bitmap of
+/// [`VIEW_WRITE_BITS`] bits (one per 64 KiB piece of tracked host copies) set
+/// by shader writes through view-heap buffer descriptors.
+pub const SLOT_VIEW_WRITES: u8 = 251;
+/// [`SLOT_VIEW_MARKS`] `base_bit` sentinel for an untracked view-heap slot.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in [`SLOT_VIEW_WRITES`] (512 KiB = 131,072 dwords = 4,194,304 bits;
+/// the last bit `VIEW_WRITE_BITS - 1` is reserved as an out-of-bounds sink).
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -160,6 +175,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// For heap buffer UAV handles: the clamped view-heap slot index that made
+    /// each handle (`heap_handle`), for `SLOT_VIEW_MARKS` lookup on writes.
+    pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -217,6 +235,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            view_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -446,7 +465,11 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.

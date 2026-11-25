@@ -724,12 +724,14 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES, 1, 1);
+                warp.list.SetComputeRootShaderResourceView(4, differs_gpu);
+                crate::host::card_compare_dispatch(
+                    &warp.list,
+                    [0u32, 0, size as u32, PIECES, 0, mode, victory_shader::emit::VIEW_MARK_NONE],
+                );
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -791,7 +793,11 @@ void main() {
                     warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                     warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                     warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                    crate::host::card_compare_dispatch(&warp.list, [0, skew, size as u32, PIECES, 0, mode]);
+                    warp.list.SetComputeRootShaderResourceView(4, differs_gpu);
+                    crate::host::card_compare_dispatch(
+                        &warp.list,
+                        [0, skew, size as u32, PIECES, 0, mode, victory_shader::emit::VIEW_MARK_NONE],
+                    );
                 }
                 warp.submit_and_wait();
                 // SAFETY: as above.
@@ -879,10 +885,11 @@ void main() {
             unsafe {
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, SKEW, size as u32, pieces, 0, mode];
+                let constants = [0u32, SKEW, size as u32, pieces, 0, mode, victory_shader::emit::VIEW_MARK_NONE];
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootShaderResourceView(4, differs_gpu);
                 crate::host::card_compare_dispatch(&warp.list, constants);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
@@ -938,6 +945,95 @@ void main() {
         piece0[5] ^= 1;
         piece0[9] ^= 2;
         assert_eq!(slot(PIECE - SKEW as usize), piece0);
+    }
+
+    /// End-to-end WARP check of `CARD_COMPARE` mark skipping, `MARK_HARVEST`,
+    /// and `MARK_CLEAR`: untouched pieces skip hashing, marked pieces are
+    /// hashed and harvested, and `MARK_CLEAR` zeroes the bitmap.
+    #[test]
+    fn warp_view_marks_skip_compare_harvest_and_clear() {
+        use crate::host::{CARD_COMPARE, MARK_CLEAR, MARK_HARVEST};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("CARD_COMPARE compiles on WARP");
+        let harvest = compile_cs(&warp.device, MARK_HARVEST).expect("MARK_HARVEST compiles on WARP");
+        let clear = compile_cs(&warp.device, MARK_CLEAR).expect("MARK_CLEAR compiles on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        const MARK_BASE: u32 = 35; // crosses a 32-bit word boundary
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_marks, marks_ptr, marks_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 19 + i / 113) as u8).collect();
+        // SAFETY: mappings cover the written sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
+            std::ptr::write_bytes(marks_ptr, 0, 64);
+            // Initialize piece hashes.
+            warp.list.SetComputeRootSignature(&compare.root);
+            warp.list.SetPipelineState(&compare.pso);
+            warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            warp.list.SetComputeRootShaderResourceView(4, marks_gpu);
+            crate::host::card_compare_dispatch(
+                &warp.list,
+                [0, 0, size as u32, PIECES, 0, 0, victory_shader::emit::VIEW_MARK_NONE],
+            );
+        }
+        warp.submit_and_wait();
+
+        // Mutate ALL three pieces in `now`, but mark ONLY piece 1 in `view_writes`.
+        let bit1 = MARK_BASE + 1;
+        // SAFETY: inside mappings.
+        unsafe {
+            now_ptr.add(10).write_volatile(content[10] ^ 0x55);
+            now_ptr.add(PIECE + 20).write_volatile(content[PIECE + 20] ^ 0x55);
+            now_ptr.add(2 * PIECE + 30).write_volatile(content[2 * PIECE + 30] ^ 0x55);
+            marks_ptr
+                .cast::<u32>()
+                .add((bit1 >> 5) as usize)
+                .write_volatile(1u32 << (bit1 & 31));
+            for p in 0..PIECES as usize {
+                differs_ptr.cast::<u32>().add(p).write_volatile(7);
+                differs_ptr.cast::<u32>().add(4 + p).write_volatile(7);
+            }
+            // 1. CARD_COMPARE with MARK_BASE: skips pieces 0 and 2, flags piece 1.
+            warp.list.SetComputeRootSignature(&compare.root);
+            warp.list.SetPipelineState(&compare.pso);
+            warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            warp.list.SetComputeRootShaderResourceView(4, marks_gpu);
+            crate::host::card_compare_dispatch(&warp.list, [0, 0, size as u32, PIECES, 0, 2, MARK_BASE]);
+            // 2. MARK_HARVEST into `differs` at dword 4: copies `[0, 1, 0]`.
+            warp.list.SetComputeRootSignature(&harvest.root);
+            warp.list.SetPipelineState(&harvest.pso);
+            let hc = [MARK_BASE, 0u32, PIECES, 16u32];
+            warp.list.SetComputeRoot32BitConstants(0, 4, hc.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, marks_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+            warp.list.Dispatch(1, 1, 1);
+            // 3. UAV barrier + MARK_CLEAR zeroes the bitmap.
+            warp.list.ResourceBarrier(&[uav_barrier()]);
+            warp.list.SetComputeRootSignature(&clear.root);
+            warp.list.SetPipelineState(&clear.pso);
+            let words = 4u32;
+            warp.list.SetComputeRoot32BitConstants(0, 1, std::ptr::from_ref(&words).cast(), 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, marks_gpu);
+            warp.list.Dispatch(1, 1, 1);
+        }
+        warp.submit_and_wait();
+        // SAFETY: inside `differs` and `marks` mappings.
+        let cmp_out = [0, 1, 2].map(|p| unsafe { differs_ptr.cast::<u32>().add(p).read_volatile() });
+        let harv_out = [4, 5, 6].map(|p| unsafe { differs_ptr.cast::<u32>().add(p).read_volatile() });
+        let cleared = [0, 1, 2, 3].map(|w| unsafe { marks_ptr.cast::<u32>().add(w).read_volatile() });
+        assert_eq!(cmp_out, [0, 1, 0], "CARD_COMPARE must skip unmarked pieces 0 and 2");
+        assert_eq!(harv_out, [0, 1, 0], "MARK_HARVEST must copy exact dirty bits");
+        assert_eq!(cleared, [0, 0, 0, 0], "MARK_CLEAR must zero active words");
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

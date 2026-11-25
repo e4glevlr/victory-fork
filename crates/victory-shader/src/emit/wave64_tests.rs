@@ -109,6 +109,7 @@ fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Re
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
@@ -518,6 +519,7 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     lowered.expect("lower").wave_size

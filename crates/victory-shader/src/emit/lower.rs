@@ -25,6 +25,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Per-view dirty-page marking for buffer UAV writes.
+#[path = "marks.rs"]
+mod marks;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -78,6 +82,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Emit per-view dirty-page marking (`SLOT_VIEW_MARKS` / `SLOT_VIEW_WRITES`).
+    pub view_marks: bool,
 }
 
 enum Stop {
@@ -3088,6 +3094,7 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        self.s.view_index.remove(&h);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -10614,17 +10621,22 @@ impl<'a> Lower<'a> {
                 }
                 self.end_guarded(second, &[]);
             }
+            self.mark_view_write(h, marks::WriteOffset::Byte(byte), bits / 8);
             self.end_guarded(at, &[]);
             return Ok(());
         }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (h, coords, mark_off) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    (
+                        self.handle(site, src, false, (11 | u, 0))?,
+                        [byte, iu, iu],
+                        marks::WriteOffset::Byte(byte),
+                    )
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -10632,9 +10644,13 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    (h, [index, off, iu], marks::WriteOffset::Strided(index, stride, off))
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (
+                    self.handle(site, src, false, (11 | u, 0))?,
+                    [off, iu, iu],
+                    marks::WriteOffset::Byte(off),
+                ),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -10666,6 +10682,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
+            self.mark_view_write(h, mark_off, 4);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -10695,25 +10712,27 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
-            let (op, name) = if typed {
+            let (op, name, mark_off, mark_bytes) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let idx = index.unwrap_or(self.s.m.i32(0));
+                args.extend([idx, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
-                (69, "bufferStore.f32")
+                (69, "bufferStore.f32", marks::WriteOffset::Typed(idx), 16)
             } else {
-                match index {
+                let mark_off = match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
                     Some(index) if used.is_some_and(|u| u.stride == 1) => {
                         let byte = self.s.m.bin(c, Bin::Add, index, off);
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([byte, iu]);
+                        marks::WriteOffset::Byte(byte)
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
@@ -10722,15 +10741,17 @@ impl<'a> Lower<'a> {
                         }
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
+                        marks::WriteOffset::Strided(index, stride, off)
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([off, iu]);
+                        marks::WriteOffset::Byte(off)
                     }
-                }
+                };
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
+                (140, "rawBufferStore.i32", mark_off, 4 * count)
             };
             args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
             if !typed {
@@ -10739,6 +10760,7 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            self.mark_view_write(args[0], mark_off, mark_bytes);
             self.end_guarded(at, &[]);
             return Ok(());
         }

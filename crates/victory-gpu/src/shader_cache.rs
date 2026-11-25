@@ -33,6 +33,14 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// Whether translated shaders mark the 64 KiB pieces they write through
+/// view-heap buffer UAVs into `SLOT_VIEW_WRITES` (`VICTORY_VIEW_MARKS=0`
+/// disables it; enabled by default).
+pub(crate) fn view_marks_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0"))
+}
+
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
@@ -86,6 +94,7 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_VIEW_MARKS",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
@@ -105,7 +114,11 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // the log names them by.
     let translate = |c: &[u8]| {
         let wide = victory_shader::emit::wave_wide_only(&blake3::hash(c).to_hex()[..16]);
-        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        let options = victory_shader::emit::Options {
+            view_marks: view_marks_enabled(),
+        };
+        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate_with(c, options))
+            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),

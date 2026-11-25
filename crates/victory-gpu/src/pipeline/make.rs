@@ -110,13 +110,46 @@ impl Pending {
     }
 
     fn make(&self) {
-        let _ = self.begun.set(Instant::now());
-        self.made
+        let started = Instant::now();
+        let _ = self.begun.set(started);
+        let made = self
+            .made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let elapsed = started.elapsed();
+        if elapsed >= slow_pso_threshold() {
+            let shaders: Vec<String> = self
+                .shaders
+                .iter()
+                .map(|s| format!("{} {}", s.stage, s.hash))
+                .collect();
+            tracing::warn!(
+                ms = elapsed.as_millis(),
+                ok = made.is_some(),
+                ?shaders,
+                "slow host pipeline compile"
+            );
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Threshold above which a host pipeline compile is logged (`VICTORY_SLOW_PSO_MS`,
+/// default 500 ms; 0 disables the warning).
+fn slow_pso_threshold() -> Duration {
+    static LIMIT: OnceLock<Duration> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let ms = std::env::var("VICTORY_SLOW_PSO_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(500);
+        if ms == 0 {
+            Duration::MAX
+        } else {
+            Duration::from_millis(ms)
+        }
+    })
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do

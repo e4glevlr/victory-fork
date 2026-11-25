@@ -77,6 +77,136 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Contiguous run `(base_bit, pieces)` in `SLOT_VIEW_WRITES` (one bit per
+    /// 64 KiB piece from `start >> 16`), returned to `MARKS` on drop.
+    marks: Option<(u32, u32)>,
+}
+
+/// Dwords of the global `SLOT_VIEW_WRITES` dirty-piece bitmap (512 KiB).
+const VIEW_WRITE_WORDS: u32 = victory_shader::emit::VIEW_WRITE_BITS / 32;
+/// Usable bits in `SLOT_VIEW_WRITES` (the last bit is reserved as the clamped OOB sink).
+const MARK_USABLE_BITS: u32 = victory_shader::emit::VIEW_WRITE_BITS - 1;
+
+/// Contiguous bit-run allocator for `Shadow::marks` in `[0, MARK_USABLE_BITS)`.
+struct Marks {
+    /// Free runs `(start_bit, len)`, sorted by `start_bit`, disjoint and non-adjacent.
+    free: Vec<(u32, u32)>,
+    /// Current high-water mark of live allocations.
+    high: u32,
+    /// Monotonic peak of `high` so `MARK_CLEAR` always clears any word ever written.
+    peak: u32,
+}
+
+impl Marks {
+    const fn new() -> Self {
+        Self {
+            free: Vec::new(),
+            high: 0,
+            peak: 0,
+        }
+    }
+
+    fn take(&mut self, bits: u32) -> Option<u32> {
+        if bits == 0 {
+            return None;
+        }
+        if let Some(i) = self.free.iter().position(|&(_, len)| len >= bits) {
+            let base = self.free[i].0;
+            if self.free[i].1 == bits {
+                self.free.remove(i);
+            } else {
+                self.free[i].0 += bits;
+                self.free[i].1 -= bits;
+            }
+            return Some(base);
+        }
+        let end = self.high.checked_add(bits)?;
+        if end > MARK_USABLE_BITS {
+            return None;
+        }
+        let base = self.high;
+        self.high = end;
+        self.peak = self.peak.max(self.high);
+        Some(base)
+    }
+
+    fn give(&mut self, base: u32, bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        let pos = self.free.partition_point(|&(start, _)| start < base);
+        self.free.insert(pos, (base, bits));
+        if pos + 1 < self.free.len() && self.free[pos].0 + self.free[pos].1 == self.free[pos + 1].0 {
+            let next_len = self.free[pos + 1].1;
+            self.free[pos].1 += next_len;
+            self.free.remove(pos + 1);
+        }
+        if pos > 0 && self.free[pos - 1].0 + self.free[pos - 1].1 == self.free[pos].0 {
+            let cur_len = self.free[pos].1;
+            self.free[pos - 1].1 += cur_len;
+            self.free.remove(pos);
+        }
+        if let Some(&(start, len)) = self.free.last()
+            && start + len == self.high
+        {
+            self.free.pop();
+            self.high = start;
+        }
+    }
+
+    fn clear_words(&self) -> u32 {
+        self.peak.div_ceil(32).min(VIEW_WRITE_WORDS)
+    }
+}
+
+static MARKS: Mutex<Marks> = Mutex::new(Marks::new());
+
+fn take_marks(start: u64, len: u64) -> Option<(u32, u32)> {
+    if !crate::shader_cache::view_marks_enabled() {
+        return None;
+    }
+    let count = u32::try_from(pieces_of(start as usize, 0, (len as usize).max(1)).end).ok()?;
+    MARKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(count)
+        .map(|base| (base, count))
+}
+
+fn give_marks(base: u32, count: u32) {
+    MARKS.lock().unwrap_or_else(|e| e.into_inner()).give(base, count);
+}
+
+/// Device-local 512 KiB bitmap (`SLOT_VIEW_WRITES`) where shaders atomically OR
+/// bits for the 64 KiB pieces they write; read by `CARD_COMPARE` / `MARK_HARVEST`
+/// and cleared by `MARK_CLEAR` on the GPU between flights.
+static VIEW_WRITES: std::sync::OnceLock<Option<(ID3D12Resource, u64)>> = std::sync::OnceLock::new();
+
+/// GPU virtual address of the global `SLOT_VIEW_WRITES` bitmap, created on first use.
+pub(crate) fn view_writes() -> Option<u64> {
+    VIEW_WRITES
+        .get_or_init(|| {
+            let host = host()?;
+            let bytes = u64::from(VIEW_WRITE_WORDS) * 4;
+            let buffer = host.uav_buffer(bytes)?;
+            crate::host::name(&buffer, || "view-heap buffer write marks bitmap".to_owned());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some((buffer, gpu))
+        })
+        .as_ref()
+        .map(|v| v.1)
+}
+
+/// GPU virtual address of `SLOT_VIEW_WRITES` if already allocated.
+pub(crate) fn view_writes_gpu_if_ready() -> Option<u64> {
+    VIEW_WRITES.get().and_then(|v| v.as_ref().map(|x| x.1))
+}
+
+/// Dwords of `SLOT_VIEW_WRITES` to zero in `MARK_CLEAR` (at least every word
+/// ever assigned to a shadow so dropped shadows leave no stale bits behind).
+pub(crate) fn marks_clear_words() -> u32 {
+    MARKS.lock().unwrap_or_else(|e| e.into_inner()).clear_words()
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1345,12 +1475,22 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// and a range `[address, end)` its shaders may have written, declared and
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
+#[cfg(test)]
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    let tagged: Vec<(Arc<Shadow>, usize, usize, Option<Vec<bool>>)> =
+        work.iter().map(|(s, a, e)| (s.clone(), *a, *e, None)).collect();
+    find_all_marked(&tagged)
+}
+
+/// As [`find_all`], with an optional per-64 KiB-piece write mask harvested from
+/// `SLOT_VIEW_WRITES`: pieces whose bit is `false` were not written by shaders
+/// and are skipped without reading host memory.
+pub(crate) fn find_all_marked(work: &[(Arc<Shadow>, usize, usize, Option<Vec<bool>>)]) -> Vec<Vec<(usize, usize)>> {
     // Hold read locks on every unique Shadow's snapshot across `find_pieces`
     // in deterministic pointer order so concurrent `merge_under_writes` or
     // `copy_back_done` cannot mutate or free `before` / `self.data` while
     // worker threads compare them.
-    let mut unique: Vec<&Arc<Shadow>> = work.iter().map(|(s, _, _)| s).collect();
+    let mut unique: Vec<&Arc<Shadow>> = work.iter().map(|(s, _, _, _)| s).collect();
     unique.sort_unstable_by_key(|s| Arc::as_ptr(s) as usize);
     unique.dedup_by_key(|s| Arc::as_ptr(s) as usize);
     let guards: Vec<(usize, std::sync::RwLockReadGuard<'_, Option<Vec<u8>>>)> = unique
@@ -1359,13 +1499,15 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
         .collect();
     let scans = work
         .iter()
-        .map(|(shadow, address, end)| {
+        .map(|(shadow, address, end, marks)| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             let key = Arc::as_ptr(shadow) as usize;
             let i = guards.binary_search_by_key(&key, |&(k, _)| k).expect("shadow in guards");
+            let first_piece = (shadow.start as usize + from) / PIECE;
+            let mask = marks.as_ref().map(|m| (first_piece, Arc::new(m.clone())));
             match guards[i].1.as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to, mask),
+                None => (0, 0, 0, 0, 0, None),
             }
         })
         .collect();
@@ -1374,18 +1516,20 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
     found
 }
 
+type PieceMask = Option<(usize, Arc<Vec<bool>>)>;
+
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
-/// are, the title address the copy starts at, offsets from and to): the
-/// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
-/// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
-/// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
-/// work of about [`WIDE_JOB`] bytes that hold whole pieces.
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+/// are, the title address the copy starts at, offsets from and to, and an
+/// optional piece write mask): the 64 KiB pieces (cut at multiples of 64 KiB
+/// of title memory, as [`Shadow::differing`] cuts them) of `[from, to)` whose
+/// bytes differ, as (offset, bytes) in order. On several threads ([`wide`]),
+/// in pieces of work of about [`WIDE_JOB`] bytes that hold whole pieces.
+fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize, PieceMask)>) -> Vec<Vec<(usize, usize)>> {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
-    // A job's part of a scan: the scan, then which and place.
-    type Part = (usize, usize, usize, usize, usize, usize, usize);
+    // A job's part of a scan: the scan, optional piece mask, then which and place.
+    type Part = (usize, usize, usize, usize, usize, PieceMask, usize, usize);
     let found: Arc<Mutex<Found>> = Arc::default();
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<Part> = Vec::new();
@@ -1398,23 +1542,32 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         let found = found.clone();
         jobs.push(Box::new(move || {
             let mut mine: Found = Vec::with_capacity(group.len());
-            for (data, before, start, from, to, which, place) in group {
+            for (data, before, start, from, to, mask, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
                     let n = (PIECE - (start + at) % PIECE).min(to - at);
-                    // SAFETY: inside the copy's mapping and its snapshot
-                    // (which holds the copy's bytes at the copy's offsets);
-                    // nothing writes either while a submission's results
-                    // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
+                    let marked = match &mask {
+                        Some((first_piece, bits)) => {
+                            let idx = (start + at) / PIECE - *first_piece;
+                            bits.get(idx).copied().unwrap_or(true)
+                        }
+                        None => true,
                     };
-                    if now != old {
-                        pieces.push((at, n));
+                    if marked {
+                        // SAFETY: inside the copy's mapping and its snapshot
+                        // (which holds the copy's bytes at the copy's offsets);
+                        // nothing writes either while a submission's results
+                        // are compared.
+                        let (now, old) = unsafe {
+                            (
+                                std::slice::from_raw_parts((data + at) as *const u8, n),
+                                std::slice::from_raw_parts((before + at) as *const u8, n),
+                            )
+                        };
+                        if now != old {
+                            pieces.push((at, n));
+                        }
                     }
                     at += n;
                 }
@@ -1424,7 +1577,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }));
     };
     let count = scans.len();
-    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
+    for (which, (data, before, start, from, to, mask)) in scans.into_iter().enumerate() {
         let (mut at, mut place) = (from, 0);
         while at < to {
             // Cut where pieces end, so that every job sees whole pieces.
@@ -1436,7 +1589,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     next = (at + PIECE - (start + at) % PIECE).min(to);
                 }
             }
-            group.push((data, before, start, at, next, which, place));
+            group.push((data, before, start, at, next, mask.clone(), which, place));
             bytes += next - at;
             place += 1;
             at = next;
@@ -1551,7 +1704,7 @@ mod wide_tests {
         let mut wanted = Vec::new();
         for start in [0usize, 4096, PIECE - 16, 0xd_b790_df00] {
             for (from, to) in [(0, len), (0, 1), (1, 2), (PIECE - 1, PIECE + 1), (3 * PIECE, 3 * PIECE), (12345, len - 1), (WIDE_JOB - 3, 2 * WIDE_JOB + 10)] {
-                scans.push((data, before, start, from, to));
+                scans.push((data, before, start, from, to, None));
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
@@ -1565,9 +1718,30 @@ mod wide_tests {
             }
         }
         // A scan of nothing (a range whose snapshot is gone).
-        scans.push((0, 0, 0, 0, 0));
+        scans.push((0, 0, 0, 0, 0, None));
         wanted.push(Vec::new());
         assert_eq!(find_pieces(scans), wanted);
+    }
+
+    #[test]
+    fn mark_runs_are_reused_and_joined() {
+        let mut marks = super::Marks::new();
+        let a = marks.take(10).unwrap();
+        let b = marks.take(20).unwrap();
+        let c = marks.take(5).unwrap();
+        assert_eq!((a, b, c), (0, 10, 30));
+        assert_eq!(marks.clear_words(), 2);
+        // Freeing middle then first joins into one 30-bit free run.
+        marks.give(b, 20);
+        marks.give(a, 10);
+        assert_eq!(marks.free, vec![(0, 30)]);
+        assert_eq!(marks.take(25), Some(0));
+        assert_eq!(marks.free, vec![(25, 5)]);
+        // Freeing tail shrinks `high` while `peak` preserves clear coverage.
+        marks.give(c, 5);
+        assert_eq!(marks.high, 25);
+        assert_eq!(marks.free, vec![]);
+        assert_eq!(marks.clear_words(), 2);
     }
 }
 
@@ -1644,6 +1818,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if let Some((base, count)) = self.marks.take() {
+            give_marks(base, count);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -1943,6 +2120,9 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        if let Some((base, count)) = shadow.marks.take() {
+            give_marks(base, count);
+        }
         shadow
     }
 
@@ -1979,7 +2159,26 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            marks: take_marks(start, len),
         }
+    }
+
+    /// Base bit of this copy in `SLOT_VIEW_WRITES`, if tracked.
+    pub(crate) fn mark_base(&self) -> Option<u32> {
+        self.marks.map(|m| m.0)
+    }
+
+    /// `(base_bit, phase)` for a buffer UAV starting at title address `view_start`.
+    pub(crate) fn mark_entry(&self, view_start: u64) -> Option<(u32, u32)> {
+        let (base, count) = self.marks?;
+        if view_start < self.start || view_start >= self.start + self.len {
+            return None;
+        }
+        let piece = ((view_start >> 16) - (self.start >> 16)) as u32;
+        if piece >= count {
+            return None;
+        }
+        Some((base + piece, (view_start & 0xFFFF) as u32))
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1998,7 +2197,7 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -2008,7 +2207,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marks.is_some());
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

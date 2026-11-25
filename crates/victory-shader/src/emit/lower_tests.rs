@@ -157,6 +157,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        view_marks: false,
     })
     .map(|_| ())
 }
@@ -207,6 +208,7 @@ fn lower_wave(
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        view_marks: false,
     })
 }
 
@@ -318,6 +320,7 @@ fn perm_features(selector: u32) -> u64 {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        view_marks: false,
     }).unwrap();
 
     let container =
