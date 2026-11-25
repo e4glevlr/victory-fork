@@ -3751,17 +3751,24 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    // Where each copy (by address) is in `back`, and the ranges it has:
+    // dispatches declare the same few ranges thousands of times.
+    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len, _) = step {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
+                if !seen.insert((key, range)) {
+                    continue;
+                }
+                match index.get(&key) {
+                    Some(&at) => back[at].1.push(range),
+                    None => {
+                        index.insert(key, back.len());
+                        back.push((shadow.clone(), vec![range]));
                     }
-                    None => back.push((shadow.clone(), vec![range])),
                 }
             }
         }
@@ -6986,6 +6993,12 @@ fn wide_refresh() -> bool {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+///
+/// So is a copy's range brought up to date: most lists of a world
+/// submission ask for the big heap's copy again, and one that is not
+/// write-watched was copied whole each time. What the title's threads
+/// write meanwhile is for later submissions, as with one asking
+/// (`crate::watch::once`).
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -6994,14 +7007,28 @@ struct Batch {
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
     index: std::collections::HashMap<usize, usize>,
+    /// The range of each copy (by address) brought up to date since the
+    /// last title write (the copy held, so that its address names no other).
+    current: Current,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
+
+/// [`Batch::current`]: per copy (by address), the copy and its range.
+type Current =
+    std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|&(_, a, b)| a <= address && end <= b)
+        {
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -7025,7 +7052,27 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
+        Self::now_current(&mut self.current, &shadow, from, to);
         Self::update(&shadow, from, to);
+    }
+
+    /// `[from, to)` of `shadow`'s copy is being brought up to date: kept in
+    /// `current` as the union with what was if they touch, else the larger.
+    fn now_current(
+        current: &mut Current,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        from: usize,
+        to: usize,
+    ) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let (_, a, b) = current
+            .entry(key)
+            .or_insert_with(|| (shadow.clone(), from, to));
+        if from <= *b && *a <= to {
+            (*a, *b) = ((*a).min(from), (*b).max(to));
+        } else if to - from > *b - *a {
+            (*a, *b) = (from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -7046,14 +7093,18 @@ impl Batch {
     }
 
     /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// first, and textures and copies are brought up to date again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.current.clear();
     }
 
     fn flush(&mut self) {
         self.index.clear();
+        for (shadow, from, to) in &self.refreshes {
+            Self::now_current(&mut self.current, shadow, *from, *to);
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -8812,6 +8863,60 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// A copy's range brought up to date is not copied again in the
+    /// submission until a step writes title memory: most lists of a world
+    /// submission ask for the big heap's copy, and one that is not
+    /// write-watched was copied whole for each.
+    #[test]
+    fn a_copy_is_refreshed_once_until_a_title_write() {
+        use crate::shadow::{find, register, unregister};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let len = 4 * PAGE;
+        // SAFETY: a fresh allocation, not write-watched, kept to the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        batch.flush();
+        assert!(copy.unwatched(), "each refresh copies its whole range");
+        // Later lists of the submission ask for part of it, or all of it.
+        batch.add(&copy, p + 100, 200);
+        batch.add(&copy, p, len);
+        assert!(batch.refreshes.is_empty(), "current: nothing to copy");
+        // A title buffer copy writes there: asked for again.
+        batch.title_written();
+        // SAFETY: a byte of our allocation.
+        unsafe { ((p + PAGE + 20) as *mut u8).write_volatile(0x55) };
+        batch.add(&copy, p + PAGE, 64);
+        assert_eq!(batch.refreshes.len(), 1, "after a title write");
+        // A list whose shaders write the copy: its refresh alone, and that
+        // is current too.
+        batch.flush_one(&copy);
+        assert_eq!(host(PAGE + 20), 0x55);
+        batch.add(&copy, p + PAGE + 8, 8);
+        assert!(batch.refreshes.is_empty(), "current after its own flush");
+        batch.add(&copy, p + 2 * PAGE, PAGE);
+        assert_eq!(batch.refreshes.len(), 1, "beyond what is current");
+        batch.flush();
+        unregister(p, p as u64);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
