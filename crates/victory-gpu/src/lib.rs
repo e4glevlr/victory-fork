@@ -51,6 +51,8 @@ pub mod queue;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -69,6 +71,8 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(windows)]
+pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
