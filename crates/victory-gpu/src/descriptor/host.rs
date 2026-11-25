@@ -65,8 +65,9 @@ pub(crate) struct HostHeap {
     /// View heaps: the title address of the buffer view at each title slot,
     /// two dwords per slot, for shaders that read a descriptor's address out
     /// of a table at an index they compute
-    /// (`victory_shader::emit::SLOT_VIEWS`).
-    views: Option<(ID3D12Resource, u64, usize)>,
+    /// (`victory_shader::emit::SLOT_VIEWS`), allocated lazily on first use
+    /// (`ensure_views`).
+    views: std::sync::OnceLock<Option<(ID3D12Resource, u64, usize)>>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -915,6 +916,28 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// Writes one `SLOT_VIEWS` record `(address_lo, address_hi, byte_len, stride)`.
+///
+/// # Safety
+/// `index < SLOT_VIEWS_COUNT` and `data` must point to a mapped `SLOT_VIEWS`
+/// upload buffer of `SLOT_VIEWS_COUNT * SLOT_VIEWS_RECORD_BYTES` bytes.
+unsafe fn write_view_slot(
+    data: usize,
+    index: u32,
+    range: Option<(u64, u64)>,
+    stride: Option<u32>,
+) {
+    // SAFETY: caller guarantees `index` lies inside the mapped `SLOT_VIEWS` buffer.
+    unsafe {
+        let at = (data as *mut u32).add(index as usize * 4);
+        let (address, len) = range.unwrap_or((0, 0));
+        at.write_volatile(address as u32);
+        at.add(1).write_volatile((address >> 32) as u32);
+        at.add(2).write_volatile(len as u32);
+        at.add(3).write_volatile(stride.unwrap_or(0));
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1105,20 +1128,6 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize, slots))
             })
             .flatten();
-        let views = (!sampler)
-            .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT)
-                    * u64::from(victory_shader::emit::SLOT_VIEWS_RECORD_BYTES);
-                let (buffer, data) = host.upload_buffer(bytes)?;
-                // SAFETY: the buffer's whole mapping; a live buffer.
-                let gpu = unsafe {
-                    std::ptr::write_bytes(data, 0, bytes as usize);
-                    buffer.GetGPUVirtualAddress()
-                };
-                crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
-                Some((buffer, gpu, data as usize))
-            })
-            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -1134,7 +1143,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             marks,
-            views,
+            views: std::sync::OnceLock::new(),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1335,14 +1344,41 @@ impl HostHeap {
         }
     }
 
-    /// The GPU address of the table of view addresses by title slot.
-    pub(crate) fn views_gpu(&self) -> Option<u64> {
-        self.views.as_ref().map(|s| s.1)
-    }
-
-    /// The view-address table's buffer, for a list to hold.
-    pub(crate) fn views_buffer(&self) -> Option<&ID3D12Resource> {
-        self.views.as_ref().map(|s| &s.0)
+    /// The table of view addresses by title slot (`SLOT_VIEWS`), allocated
+    /// and backfilled on first use so heaps that never bind a shader reading
+    /// descriptors as data pay nothing.
+    pub(crate) fn ensure_views(&self, heap: &crate::descriptor::Heap) -> Option<(&ID3D12Resource, u64)> {
+        if self.sampler {
+            return None;
+        }
+        if let Some(entry) = self.views.get() {
+            return entry.as_ref().map(|(b, gpu, _)| (b, *gpu));
+        }
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = self.views.get_or_init(|| {
+            let host = host()?;
+            let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT)
+                * u64::from(victory_shader::emit::SLOT_VIEWS_RECORD_BYTES);
+            let (buffer, data) = host.upload_buffer(bytes)?;
+            // SAFETY: the buffer's whole mapping; a live buffer.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0, bytes as usize);
+                buffer.GetGPUVirtualAddress()
+            };
+            crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
+            for &index in buffers.iter() {
+                if index >= victory_shader::emit::SLOT_VIEWS_COUNT {
+                    continue;
+                }
+                let view = heap.handle(index).and_then(crate::descriptor::view);
+                let stride = view.as_ref().and_then(view_stride);
+                let range = view.as_ref().and_then(buffer_range);
+                // SAFETY: `index < SLOT_VIEWS_COUNT` and `data` is zeroed for `SLOT_VIEWS_COUNT` slots.
+                unsafe { write_view_slot(data as usize, index, range, stride) };
+            }
+            Some((buffer, gpu, data as usize))
+        });
+        entry.as_ref().map(|(b, gpu, _)| (b, *gpu))
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1898,21 +1934,14 @@ impl HostHeap {
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
         let range = view.and_then(buffer_range);
-        if let Some((_, _, data)) = &self.views
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some((_, _, data))) = self.views.get()
             && index < victory_shader::emit::SLOT_VIEWS_COUNT
         {
-            // SAFETY: inside the mapping; a whole slot, written at once:
-            // the address, the byte length and the element stride.
-            unsafe {
-                let at = (*data as *mut u32).add(index as usize * 4);
-                let (address, len) = range.unwrap_or((0, 0));
-                at.write_volatile(address as u32);
-                at.add(1).write_volatile((address >> 32) as u32);
-                at.add(2).write_volatile(len as u32);
-                at.add(3).write_volatile(stride.unwrap_or(0));
-            };
+            // SAFETY: inside the mapping; `self.buffers` serializes writes
+            // with `ensure_views`'s backfill.
+            unsafe { write_view_slot(*data, index, range, stride) };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
             true

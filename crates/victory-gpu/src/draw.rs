@@ -1637,11 +1637,9 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
-        let gpu = host.views_gpu()?;
+        let (buffer, gpu) = host.ensure_views(heap)?;
         self.heap_buffers(list)?;
-        if let Some(buffer) = host.views_buffer() {
-            list.keep(buffer);
-        }
+        list.keep(buffer);
         Some(gpu)
     }
 
