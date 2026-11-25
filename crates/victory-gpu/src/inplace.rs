@@ -74,11 +74,17 @@ pub(crate) fn probe_level() -> u8 {
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// What it assumes, for 2: nothing of ours reads title memory that a
+/// submission not yet run writes through such a buffer. With every
+/// submission waited for that holds. With `VICTORY_LATE_WAIT` the ranges
+/// shaders may write in place are told to the flights
+/// (`HostList::defer_placed_write`), and a submission whose preparing reads
+/// them (a buffer copy, a fill, a texture, a refresh of a host copy) waits
+/// for the flights that write them, as it does for copies' declared writes.
+/// The bench title's `BENCH_READBACK=1` (a buffer copy of what the
+/// submission before wrote) read stale bytes in 1,983,520 of 1,987,200
+/// dwords without this, and none with it. The title's own reads are its
+/// business, as on the console: its fences are signalled behind the flights.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows

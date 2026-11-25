@@ -36,11 +36,29 @@ vary from run to run; CPU-side figures are not affected.
 | same, `VICTORY_INPLACE=2 VICTORY_CARD_BUFFERS=0` | 4.8 ms |
 
 In place, nothing is copied either way and no change check runs; the
-output was right in every run. Two cautions before making it the default:
-`inplace.rs` says level 2 is not safe together with late wait (on by
-default now), and the bench's shader does not read its inputs, so it does
-not show the cost of shaders reading big buffers over the bus, which is
-why big buffers are kept in card memory.
+output was right in every run.
+
+### In place with late wait
+
+`VICTORY_INPLACE=2` was documented as unsafe with late wait (on by
+default): a submission sent ahead writes title memory directly through a
+placed buffer, and the flights' rules only knew the writes copies declare,
+so a later submission could read those bytes on the CPU (a buffer copy, a
+fill, a texture, a refresh of another copy) before the GPU had written
+them. Shown with the bench's `BENCH_READBACK=1` (each submission copies the
+output the one before it wrote): 1,983,520 of 1,987,200 dwords stale.
+
+Now `Shadow::gpu_writes` tells the list the ranges shaders may write in
+place (`HostList::defer_placed_write`); they travel with the flight, join
+the line's `written` ranges (so buffer copies, fills, textures and memory
+waits that touch them wait for those flights), and a separate `placed` list
+also holds up refreshes of host copies that read them
+(`refresh_blocked`). Same test: every dword right, 4.8 ms a frame (17.7 ms
+with default settings).
+
+One caution remains before making in place the default: the bench's shader
+does not read its inputs, so it does not show the cost of shaders reading
+big buffers over the bus, which is why big buffers are kept in card memory.
 
 ## What changed
 
@@ -99,5 +117,5 @@ can take up to that long. A lower value trades stalls for missing draws.
 ## Next
 
 - Async compute (second host queue with GPU-side waits between queues).
-- In place by default: make level 2 safe with late wait, and make the bench's shader read its inputs so the bus cost shows.
+- In place by default: make the bench's shader read its inputs so the bus cost shows, then decide.
 - Run the game with the diagnostics build once its files are available.
