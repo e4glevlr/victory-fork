@@ -3653,15 +3653,23 @@ impl<'a> Lower<'a> {
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
-        // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block.
-        let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
-                need(made.unwrap_or(0));
+        // say) is the ballot of the lanes that are there: all of them, where every lane of
+        // the wave runs that block (two exchanging host waves know it; a native compute
+        // program's wave is the console's, so its lane branches tell).
+        if !self.x.st.active.contains(&lo) {
+            let made = self.def_block.get(&lo).copied();
+            let whole = self.mask_data == MaskData::Console
+                && !self.local
+                && made.is_none_or(|b| match &self.exchange {
+                    Some(_) => self.all_lanes(b),
+                    None => all_lane_blocks(self.x.st).is_some_and(|all| all.get(b).copied().unwrap_or(false)),
+                });
+            if !whole {
+                if self.mask_data == MaskData::Console && !self.local {
+                    need(made.unwrap_or(0));
+                }
+                return Err(MASK_ELSEWHERE);
             }
-            return Err(MASK_ELSEWHERE);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,

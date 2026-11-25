@@ -891,3 +891,17 @@ fn scalar_dynamic_offset_wraps_vgpr_input_and_phi_in_wave_read_lane_first() {
         "code_smem must emit waveReadLaneFirst.i32 for VGPR-phi dynamic offset"
     );
 }
+
+#[test]
+fn native_wave32_complement_mask_in_all_lanes_block_lowers() {
+    // A complement of EXEC holds lanes outside EXEC, but in an all-lanes
+    // block of a native wave32 compute shader every lane runs the ballot.
+    let words = [
+        0x8802_C17E, // s_xor_b32 s2, exec_lo, -1
+        0x7E02_0202, // v_mov_b32 v1, s2
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
+}
