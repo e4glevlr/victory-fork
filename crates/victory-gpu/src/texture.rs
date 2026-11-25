@@ -74,6 +74,11 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Its hash found it changed while its guard saw no write: the title
+    /// writes it through another view, so it is hashed at every check.
+    behind_guard: bool,
+    /// Checks of it through the guards so far (counted up to a few).
+    checks: u8,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -807,7 +812,17 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        // A texture whose hash found it changed while the guard saw nothing
+        // is hashed at every check from then on (`Last::behind_guard`): the
+        // title's video player decodes into a ring of three frames written
+        // through another view, and on its eighth-frame turn each frame of
+        // the ring was refreshed about every 24 frames, so two presented
+        // frames in three showed video from up to two seconds before (the
+        // intro). `VICTORY_TEXTURE_BEHIND_GUARD=0`: the turn only.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static BEHIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let behind_on = *BEHIND.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BEHIND_GUARD").is_none_or(|v| v != "0"));
+        let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -815,10 +830,37 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // A texture's first checks hash it whatever the turn, so one
+            // written behind its guard is found at its second use, not up
+            // to a second or two later (the intro's opening star flashed
+            // with old frames until each set of its ring had had its turn;
+            // the ring's memory moves from run to run, so it cannot be
+            // remembered by address).
+            const FIRST_CHECKS: u8 = 3;
+            let young = behind_on && last.checks < FIRST_CHECKS;
+            last.checks = last.checks.saturating_add(1);
+            if unwritten && !turn && !young && !(behind_on && last.behind_guard) {
                 return 0;
             }
+            unseen = unwritten && behind_on;
         }
+        let hash_before = last.hash;
+        let read = self.refresh_hashed(last, size);
+        // changed with no write the guard saw: hashed at every check now
+        if unseen && hash_before.is_some() && last.hash != hash_before && !last.behind_guard {
+            last.behind_guard = true;
+            tracing::info!(
+                memory = ?self.memory,
+                bytes = size,
+                "a texture changed with no write its guard saw (written through another view): hashed at every check from now on"
+            );
+        }
+        read
+    }
+
+    /// [`Staging::refresh_timed`] past the write watch and the guards: the
+    /// texture's memory read, hashed and detiled if it changed.
+    fn refresh_hashed(&self, last: &mut Last, size: usize) -> usize {
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
