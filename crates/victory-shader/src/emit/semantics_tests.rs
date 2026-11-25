@@ -1048,10 +1048,8 @@ const OMOD: &str = "output multipliers keep a -0 result";
 const DENORMAL: &str = "denormal operands of min, max and float selects are the host's";
 const F16_ROUND: &str = "f16 results round toward zero";
 const F16_TWICE: &str = "f16 arithmetic rounds in f32 first, as the host chooses";
-const SCC_MIN_MAX: &str = "s_min and s_max set SCC from the result";
 const FLOOR_CVT: &str = "v_cvt_flr and v_cvt_rpi: NaN and the half";
 const MED3_ZERO: &str = "v_med3_f32 orders -0 and +0 as the host does";
-const CONSTANT_CMP: &str = "a constant compare removes the WARP device";
 const REFUSED: &str = "the lowering refuses the instruction";
 
 /// Output modifiers as the lowering applies them: the multiplier keeps a
@@ -2548,27 +2546,19 @@ fn scalar_probes() -> Vec<Probe> {
             (((u64::from(a) * u64::from(b)) >> 32) as u32, None)
         }),
         // SCC: whether the first operand was chosen (RDNA2 ISA S_MIN/S_MAX).
-        sop2_probe(0x07, ab.clone(), |a, b| (a.min(b), Some(a < b)))
-            .shows(SCC_MIN_MAX, |i| (i[0] < i[1]) != (i[0].min(i[1]) != 0)),
-        sop2_probe(0x09, ab.clone(), |a, b| (a.max(b), Some(a > b)))
-            .shows(SCC_MIN_MAX, |i| (i[0] > i[1]) != (i[0].max(i[1]) != 0)),
+        sop2_probe(0x07, ab.clone(), |a, b| (a.min(b), Some(a < b))),
+        sop2_probe(0x09, ab.clone(), |a, b| (a.max(b), Some(a > b))),
         sop2_probe(0x06, ab.clone(), |a, b| {
             (
                 (a as i32).min(b as i32) as u32,
                 Some((a as i32) < (b as i32)),
             )
-        })
-        .shows(SCC_MIN_MAX, |i| {
-            ((i[0] as i32) < (i[1] as i32)) != ((i[0] as i32).min(i[1] as i32) != 0)
         }),
         sop2_probe(0x08, ab.clone(), |a, b| {
             (
                 (a as i32).max(b as i32) as u32,
                 Some((a as i32) > (b as i32)),
             )
-        })
-        .shows(SCC_MIN_MAX, |i| {
-            ((i[0] as i32) > (i[1] as i32)) != ((i[0] as i32).max(i[1] as i32) != 0)
         }),
         sop2_probe(0x1E, shifts.clone(), |a, n| {
             (a << (n & 31), Some(a << (n & 31) != 0))
@@ -2770,14 +2760,6 @@ fn defect_f16_rounded_twice() {
     defect(p, F16_TWICE);
 }
 
-/// `s_min_*`/`s_max_*` set SCC to whether the first operand was chosen
-/// (RDNA2 ISA); the lowering sets it to `result != 0`.
-#[test]
-#[ignore = "defect: s_min and s_max set SCC from the result"]
-fn defect_scalar_min_max_scc() {
-    defect(scalar_probes(), SCC_MIN_MAX);
-}
-
 /// `v_cvt_flr_i32_f32`/`v_cvt_rpi_i32_f32` saturate a NaN by its sign and
 /// add the half exactly (measured on RDNA2, gfx1035/gfx1036, by others);
 /// the lowering gives 0 for NaN and rounds x + 0.5 first
@@ -2799,21 +2781,20 @@ fn defect_med3_signed_zeros() {
 }
 
 /// `v_cmp_f_f32` and `v_cmp_tru_f32` (always false, always true; the title
-/// uses neither): the lowered program removes the WARP device.
+/// uses neither) lower to constants. (Upstream lowered them as compares,
+/// and the lowered program removed the WARP device.)
 #[test]
-#[ignore = "defect: a constant compare removes the WARP device"]
-fn defect_constant_compares() {
+fn constant_compares_match_the_hardware() {
     let ab = pairs(&F32_EDGES[..8], &F32_EDGES[..8]);
-    let p = [0x0u16, 0xF]
+    let p: Vec<Probe> = [0x0u16, 0xF]
         .into_iter()
         .map(|op| {
             probe(with_vcc(vopc(op, v(1), 2)), ab.clone(), INT, move |_| {
                 vec![u32::from(op == 0xF)]
             })
-            .shows(CONSTANT_CMP, |_| true)
         })
         .collect();
-    defect(p, CONSTANT_CMP);
+    assert_clean(check(&p));
 }
 
 /// `v_pk_fmac_f16` and `src_scc` as a vector operand: the lowering refuses
