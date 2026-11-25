@@ -1069,6 +1069,17 @@ impl HostHeap {
         true
     }
 
+    /// Unmakes host slot `index` unconditionally for diagnostics unit tests.
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn clear_slot_for_test(&self, index: u32) -> bool {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.get(index as usize).is_none_or(|&key| key == 0) {
+            return false;
+        }
+        self.unmake(&mut made, index);
+        true
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
