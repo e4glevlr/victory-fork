@@ -61,6 +61,10 @@ pub(crate) struct Stats {
     pub scanned_mb: f64,
     pub heap_pass_ms: f64,
     pub heap_passes: f64,
+    /// Of the heap passes: ms making buffer views, refreshing their host
+    /// copies, uploading textures picked by index; MB of the spans
+    /// refreshed, and of them in copies not write-watched (read whole).
+    pub heap_parts: [f64; 5],
     pub draws: f64,
     pub dropped: f64,
     pub indirect: f64,
@@ -366,8 +370,16 @@ fn lines(s: &Stats) -> Vec<(u32, String)> {
     out.push((
         colour(s.heap_pass_ms),
         format!(
-            "heap passes  {:7.1} ms  in {:.0} passes, all recording threads (buffer views and textures picked by index)",
+            "heap passes  {:7.1} ms  in {:.0} passes, the title's recording threads",
             s.heap_pass_ms, s.heap_passes
+        ),
+    ));
+    let [views_ms, refresh_ms, textures_ms, span_mb, unwatched_mb] = s.heap_parts;
+    out.push((
+        GREY,
+        format!(
+            "  buffer views {views_ms:.1} ms, refreshing their copies {refresh_ms:.1} ms ({span_mb:.0} MB, {unwatched_mb:.0} MB not \
+             write-watched), textures picked by index {textures_ms:.1} ms"
         ),
     ));
     let [flights, settles, settle_ms] = s.sent_ahead;

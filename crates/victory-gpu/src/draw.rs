@@ -371,6 +371,11 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_PASS_MICROS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Slots looked at by those passes, and host copies brought up to date.
 pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Of those microseconds: making the slots' buffer views and finding their
+/// ranges, refreshing the host copies they cover (and the bytes of the
+/// spans, of them in copies not write-watched, which are read whole), and
+/// the textures picked by index.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1514,6 +1519,7 @@ impl State {
         HEAP_BUFFER_VISITS[0].fetch_add(slots.len() as u64, Ordering::Relaxed);
         HEAP_BUFFER_VISITS[1].fetch_add(spans.len() as u64, Ordering::Relaxed);
         let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
+        let unwatched: u64 = spans.iter().filter(|s| s.0.unwatched()).map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1553,6 +1559,17 @@ impl State {
         HEAP_BUFFER_MICROS.fetch_add(all.as_micros() as u64, Ordering::Relaxed);
         for (part, micros) in HEAP_PASS_MICROS.iter().zip([looked, refreshed - looked, all - refreshed]) {
             part.fetch_add(micros.as_micros() as u64, Ordering::Relaxed);
+        }
+        // The overlay's split: the same three parts, and the spans' bytes
+        // (of them in copies not write-watched).
+        for (part, n) in HEAP_PASS_PARTS.iter().zip([
+            looked.as_micros() as u64,
+            (refreshed - looked).as_micros() as u64,
+            (all - refreshed).as_micros() as u64,
+            bytes,
+            unwatched,
+        ]) {
+            part.fetch_add(n, Ordering::Relaxed);
         }
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.

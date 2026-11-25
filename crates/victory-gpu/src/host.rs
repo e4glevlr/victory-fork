@@ -7106,6 +7106,9 @@ impl Meter {
             scanned_mb,
             heap_pass_ms: picked_ms,
             heap_passes: picked,
+            heap_parts: [0, 1, 2, 3, 4].map(|i| {
+                crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e3, 1e3, 1e6, 1e6][i] / frames
+            }),
             draws,
             dropped,
             indirect,
