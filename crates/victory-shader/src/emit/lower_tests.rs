@@ -905,3 +905,27 @@ fn native_wave32_complement_mask_in_all_lanes_block_lowers() {
     ];
     lower_wave(&words, Vec::new(), Vec::new(), false).unwrap();
 }
+
+#[test]
+fn heap_descriptor_address_reads_from_view_table() {
+    // Loads a buffer descriptor from the bindless resource heap at a
+    // dynamic byte offset (`s1 << 5`), reads title memory through its
+    // 64-bit address, and stores the dword to LDS (#738's case).
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x8F06_8501, // s_lshl_b32 s6, s1, 5
+        0xF408_0202,
+        0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
+        0xF400_0304,
+        0xFA00_0000, // s_load_dword s12, s[8:9], null
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let layout = vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)];
+    let l = lower_wave(&words, layout, Vec::new(), false).unwrap();
+    assert!(l.root_srvs.contains(&super::super::SLOT_VIEWS));
+    assert!(l.root_srvs.contains(&super::super::SLOT_MEMORY));
+}
