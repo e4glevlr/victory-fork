@@ -473,9 +473,10 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
+/// Per IR block: every lane of the wave that started the program runs it, as often as the others
+/// – no per-lane branch separates it from the entry (it lies in no lane branch's region: the
+/// blocks reachable from the branch that do not post-dominate it, and the blocks of a loop the
+/// branch leaves). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
@@ -488,7 +489,8 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
+/// not post-dominate it, and those of a loop it leaves, which only some lanes run (or run
+/// again). Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
 fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
@@ -528,6 +530,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             }
         }
     }
+    let loops = natural_loops(&succ);
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
@@ -544,9 +547,72 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
+        // A lane branch that leaves a loop (its own back edge, a break): each lane leaves on
+        // its own, and the loop's blocks, the branch's own among them, are run again only by
+        // the lanes that stayed, though some post-dominate it.
+        for body in loops.iter().filter(|l| l[d] && succ[d].iter().any(|&s| !l[s])) {
+            for b in (0..n).filter(|&b| body[b]) {
+                seen[b] = true;
+            }
+        }
         regions.push((d, seen));
     }
     Some(regions)
+}
+
+/// The natural loops of the blocks `succ` links (each block's successors, block 0 the entry),
+/// one per header: the header and every block that reaches one of its back edges without
+/// passing through it. A back edge goes to a block no later in reverse postorder (the program
+/// is reducible: `ir::build` splits irreducible loops).
+fn natural_loops(succ: &[Vec<usize>]) -> Vec<Vec<bool>> {
+    let n = succ.len();
+    // reverse postorder of the reachable blocks
+    let mut rpo = vec![usize::MAX; n];
+    let (mut seen, mut post, mut stack) = (vec![false; n], Vec::new(), vec![(0usize, 0usize)]);
+    if n > 0 {
+        seen[0] = true;
+    }
+    while let Some(top) = stack.last_mut() {
+        let (b, i) = *top;
+        top.1 += 1;
+        match succ[b].get(i) {
+            Some(&s) if !seen[s] => {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+            Some(_) => {}
+            None => {
+                post.push(b);
+                stack.pop();
+            }
+        }
+    }
+    for (k, &b) in post.iter().rev().enumerate() {
+        rpo[b] = k;
+    }
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, s) in succ.iter().enumerate() {
+        for &t in s {
+            pred[t].push(b);
+        }
+    }
+    let mut loops: HashMap<usize, Vec<bool>> = HashMap::new();
+    for (q, s) in succ.iter().enumerate() {
+        for &h in s.iter().filter(|&&h| rpo[q] != usize::MAX && rpo[h] <= rpo[q]) {
+            let body = loops.entry(h).or_insert_with(|| {
+                let mut v = vec![false; n];
+                v[h] = true;
+                v
+            });
+            let mut stack = vec![q];
+            while let Some(b) = stack.pop() {
+                if !std::mem::replace(&mut body[b], true) {
+                    stack.extend(pred[b].iter().copied());
+                }
+            }
+        }
+    }
+    loops.into_values().collect()
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
