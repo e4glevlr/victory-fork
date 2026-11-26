@@ -54,10 +54,20 @@ pub const LOADS: u32 = 16;
 pub const FIRST: u32 = 32;
 /// Single-predecessor linear blocks merged into their predecessor.
 pub const MERGE: u32 = 64;
+/// Not a pass over the module either: the lowering reads the dwords of one
+/// console scalar buffer load (`s_buffer_load_dwordx2` to `x16` from a raw
+/// view) by one call for every four of them, not by a call each
+/// (`lower.rs`, `raw_dwords`). The same bytes are read. From fxceless
+/// c36971b2 (bit 64 there; bit 64 is [`MERGE`] here). Off unless asked for
+/// (`VICTORY_SHADER_OPT=255`, or with 128): on an RX 7900 XTX it was worth
+/// nothing, the driver joins the loads, and no card here has shown a gain.
+pub const WIDE: u32 = 128;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | MERGE;
-/// Every pass.
+/// Every pass that runs when nothing says which ([`WIDE`] is not one).
 pub const ALL: u32 = MODULE | FIRST;
+/// Every bit `VICTORY_SHADER_OPT` may ask for.
+pub const KNOWN: u32 = ALL | WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").

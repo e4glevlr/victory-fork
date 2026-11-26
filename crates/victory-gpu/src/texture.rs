@@ -611,6 +611,18 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle(idle_ms: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    // Under `VICTORY_RAM_TRIM_MB` pressure: the spare staging buffers kept
+    // for reuse go too.
+    if crate::host::ram_pressure() {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.1 > 0 {
+            let bytes = spare.1;
+            let count: usize = spare.0.values().map(Vec::len).sum();
+            spare.0.clear();
+            spare.1 = 0;
+            crate::host::trail(|| format!("ram-trim: drained {count} spare texture staging buffers ({} MiB)", bytes >> 20));
+        }
+    }
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;

@@ -2412,10 +2412,24 @@ impl HostHeap {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
+        // (After fxceless PR #1240.) A record of zeros in a slot never
+        // looked at is as it was, so it is not fingerprinted; a page of
+        // zeros whose slots were all never looked at is done with at once.
+        let zeros = |bytes: &[u8]| {
+            let (words, rest) = bytes.as_chunks::<8>();
+            words.iter().all(|w| u64::from_ne_bytes(*w) == 0) && rest.iter().all(|&b| b == 0)
+        };
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
+            }
+            if zeros(page) {
+                let lo = (slots.start as usize).min(copied.len());
+                let hi = (slots.end as usize).min(copied.len());
+                if copied[lo..hi].iter().all(|&last| last == 0) {
+                    return (slots.end.saturating_sub(slots.start), 0);
+                }
             }
             for index in slots {
                 let handle = start + index * step;
@@ -2432,11 +2446,14 @@ impl HostHeap {
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
+                // A slot never looked at that holds nothing: as it was.
+                if *last == 0 && zeros(record) {
+                    continue;
+                }
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                // The record last seen: as it was.
+                if *last == print {
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at

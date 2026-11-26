@@ -2159,6 +2159,116 @@ fn merge_gap() -> usize {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if changed_runs_avx2_on() {
+        // SAFETY: AVX2 support is checked at runtime (`changed_runs_avx2_on`).
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_scalar(now, was)
+}
+
+/// Whether [`changed_runs`] compares 64 bytes at a time with AVX2
+/// (`VICTORY_CHANGED_RUNS_AVX2=1`, off by default; fxceless PR #1233) on a
+/// processor that has it: the same runs as the walk (the test
+/// `avx2_changed_runs_match_the_walk`).
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_avx2_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CHANGED_RUNS_AVX2").is_some_and(|v| v == "1") && std::is_x86_feature_detected!("avx2")
+    })
+}
+
+/// [`changed_runs`] 64 bytes at a time: two 32-byte compares give a mask of
+/// the bytes that differ, and the runs are read off the masks
+/// ([`changed_runs_masks`]). Only called where AVX2 was detected.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    changed_runs_masks(now, was, |now, was, base| {
+        // SAFETY: the walker asks only for whole 64-byte blocks inside both
+        // slices; the loads are unaligned ones. AVX2 is enabled here.
+        unsafe {
+            let a = _mm256_loadu_si256(now.as_ptr().add(base).cast::<__m256i>());
+            let b = _mm256_loadu_si256(was.as_ptr().add(base).cast::<__m256i>());
+            let c = _mm256_loadu_si256(now.as_ptr().add(base + 32).cast::<__m256i>());
+            let d = _mm256_loadu_si256(was.as_ptr().add(base + 32).cast::<__m256i>());
+            let lo = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+            let hi = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, d)) as u32;
+            u64::from(lo) | (u64::from(hi) << 32)
+        }
+    })
+}
+
+/// The runs of bytes that differ, from `difference_mask` (bit `k`: byte
+/// `base + k` differs) for every whole 64-byte block, then byte by byte for
+/// the rest.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn changed_runs_masks(
+    now: &[u8],
+    was: &[u8],
+    mut difference_mask: impl FnMut(&[u8], &[u8], usize) -> u64,
+) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        let differ = difference_mask(now, was, base);
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ != u64::MAX || open.is_none() {
+            let mut at = 0u32;
+            while at < 64 {
+                match open {
+                    None => {
+                        // The next byte that differs, if any.
+                        let skip = (differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        open = Some(base + at as usize);
+                    }
+                    Some(first) => {
+                        // The next byte that is equal, if any.
+                        let skip = (!differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        runs.push((first, base + at as usize - first));
+                        open = None;
+                    }
+                }
+            }
+        }
+        base += 64;
+    }
+    for i in base..n {
+        match (open, now[i] != was[i]) {
+            (None, true) => open = Some(i),
+            (Some(first), false) => {
+                runs.push((first, i - first));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+/// [`changed_runs`] byte by byte (eight equal bytes at a time).
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2185,6 +2295,38 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod merge_tests {
     use super::{PIECE, SNAPS, back_piece, changed_runs, give_back, join_runs, pooled, take_snapshots};
+
+    /// fxceless PR #1233: the AVX2 form gives the runs the walk gives, for
+    /// every length around the 64-byte blocks and unaligned slices.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_changed_runs_match_the_walk() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for offset in 0..32 {
+            for n in [0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 511, 4097] {
+                let was = vec![0x5au8; n + offset + 2];
+                for rarity in [1, 2, 16, 64, 4096] {
+                    let mut now = was.clone();
+                    for b in &mut now {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        if seed.is_multiple_of(rarity) {
+                            *b ^= 0xff;
+                        }
+                    }
+                    let a = &now[offset..offset + n];
+                    let b = &was[offset + 1..];
+                    // SAFETY: AVX2 detection above.
+                    let avx = unsafe { super::changed_runs_avx2(a, b) };
+                    assert_eq!(avx, super::changed_runs_scalar(a, b), "offset {offset}, {n} bytes, 1 in {rarity}");
+                }
+            }
+        }
+    }
 
     /// Runs with fewer bytes between them than the gap become one, from the
     /// first's start to the last's end; the others stay as they are.
@@ -2577,6 +2719,17 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle(idle_ms: u64) {
     const IDLE_FRAMES: u64 = 4;
+    // Under `VICTORY_RAM_TRIM_MB` pressure: the snapshot buffers kept for
+    // reuse go too.
+    if crate::host::ram_pressure() {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if !pool.is_empty() {
+            let count = pool.len();
+            let bytes: u64 = pool.iter().map(|v| v.capacity() as u64).sum();
+            pool.clear();
+            crate::host::trail(|| format!("ram-trim: drained {count} pooled CPU snapshot buffers ({} MiB)", bytes >> 20));
+        }
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2596,6 +2749,7 @@ pub(crate) fn let_go_idle(idle_ms: u64) {
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
+        tables_changed();
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
@@ -4037,18 +4191,23 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // A reader that saw the old table must have an older generation. In
+    // particular, registration can spend time waiting for this lock.
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+    tables_changed();
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4089,6 +4248,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        tables_changed();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -4137,7 +4299,196 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Counts the changes of the tables [`lookup`] reads that can change what an
+/// ask finds: a buffer registered or released, a copy taken out of a table,
+/// a window made. A thread's remembered answers ([`FOUND`]) are from one
+/// count.
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::{TABLES_CHANGED, buffers, register, unregister};
+    use std::sync::{Barrier, atomic::Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pending_registration_invalidates_readers_of_the_old_table() {
+        // No GPU allocation: use the address of a private stack slot as a
+        // unique table key and hold the table in its pre-registration state.
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers();
+        let initial = TABLES_CHANGED.load(Ordering::Acquire);
+        let ready = Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 8);
+            });
+            ready.wait();
+            // Give a writer that increments before taking the lock time to
+            // publish. A correct writer stays blocked for the entire window.
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while TABLES_CHANGED.load(Ordering::Acquire) == initial && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let generation = TABLES_CHANGED.load(Ordering::Acquire);
+            assert!(!table.contains_key(&(start, resource)));
+            drop(table);
+            generation
+        });
+        let committed = TABLES_CHANGED.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_ne!(committed, observed, "the old table still has the current generation");
+    }
+}
+
+#[cfg(test)]
+mod window_cache_tests {
+    use super::{LOOSE, WINDOW, lookup_cached, tables_changed};
+    use std::sync::Arc;
+
+    #[test]
+    fn cached_window_removed_by_sweep_is_replaced() {
+        if crate::host::host().is_none() {
+            eprintln!("SKIP: no D3D12 device for the window allocation");
+            return;
+        }
+        let memory = vec![0u8; 2 * WINDOW as usize];
+        let address = (memory.as_ptr() as u64).next_multiple_of(WINDOW);
+        let find = || lookup_cached(address, 64, false).expect("host window");
+        let old = find();
+        assert!(old.window);
+        // Creating the first window advances the generation. Warm the
+        // cache in that generation before modeling the sweep handoff.
+        assert!(Arc::ptr_eq(&find(), &old));
+        assert!(Arc::ptr_eq(&find(), &old));
+        let key = (old.start, old.len);
+        let removed = LOOSE.lock().unwrap().remove(&key).unwrap();
+        assert!(Arc::ptr_eq(&removed, &old));
+        // The sweep has removed the entry and still owns its Arc, before
+        // publishing its generation. A racing weak upgrade can succeed.
+        let next = find();
+        LOOSE.lock().unwrap().remove(&key);
+        tables_changed();
+        assert!(!Arc::ptr_eq(&next, &old));
+    }
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a thread remembers what its asks found (fork pull request
+/// #1237; `VICTORY_LOOKUP_CACHE=1`).
+///
+/// Every bind of a draw asks for the host copy of each buffer it reads:
+/// under the tables' one lock, among the 64 buffers that start below the
+/// address, then, for memory outside buffers, under the windows' lock. The
+/// title's six recording threads spent 54 ms a frame there together in the
+/// prologue cell (`VICTORY_PROFILE`), and asked for the same ranges again
+/// and again. A thread now keeps what each ask (address, length, kind)
+/// found, weakly (a copy nothing else holds can still be let go), for as
+/// long as the tables have not changed ([`TABLES_CHANGED`]).
+///
+/// Here: OFF unless `VICTORY_LOOKUP_CACHE=1` until a run of ours has carried
+/// it (the pull request has it on by default); `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log.
+fn lookup_cache() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
+                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most asks a thread remembers before it starts again.
+const FOUND_MOST: usize = 8192;
+
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found, and the count of table changes they
+    /// are from.
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        return lookup_tables(address, len, any);
+    }
+    lookup_cached(address, len, any)
+}
+
+fn lookup_cached(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let changes = TABLES_CHANGED.load(Ordering::Acquire);
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = found.filter(|shadow| {
+        if !shadow.window {
+            return true;
+        }
+        // The sweeper holds LOOSE from the idle check through removal.
+        // A cache hit has to hand the window out on the same side of that
+        // boundary as a normal lookup. A removed window can still be alive.
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.get(&(shadow.start, shadow.len)).is_some_and(|entry| Arc::ptr_eq(entry, shadow)) {
+            return false;
+        }
+        note_window(shadow, address, address.saturating_add(len.max(1)), len <= 1);
+        true
+    }) {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        return Some(shadow);
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = lookup_tables(address, len, any)?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // (from the count read before the tables were: a change since
+        // clears it at the next ask). A buffer's copy in place is not kept:
+        // `in_place_let_go` takes it out of the tables when its memory is
+        // about to show something else, and a hit racing that would hand
+        // out memory being remapped (windows are checked at the hit).
+        if f.0 == changes && (shadow.window || shadow.place.is_none()) {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -4358,6 +4709,16 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Called with LOOSE held, including when handing out a cached window.
+fn note_window(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
@@ -4374,25 +4735,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     } else {
         named
     };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
     if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
+        note_window(shadow, address, end, unsized_ask);
         return Some(shadow.clone());
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
+        note_window(&shadow, address, end, unsized_ask);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -4427,8 +4780,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
-    note(&shadow);
+    note_window(&shadow, address, end, unsized_ask);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 

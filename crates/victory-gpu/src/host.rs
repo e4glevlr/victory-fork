@@ -124,6 +124,34 @@ pub(crate) fn available_memory() -> Option<(u64, u64)> {
     ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
 }
 
+/// The low-memory threshold of `VICTORY_RAM_TRIM_MB` (MiB; off unless
+/// set): below it, of physical RAM or of what this process can still
+/// commit, [`sweep`] runs every 500 ms instead of every second and also
+/// empties the pools kept for reuse (CPU snapshot buffers, spare texture
+/// staging buffers, idle host lists past 16), so a 16 GB PC does not run
+/// out of commit (Windows error 1455) or into the page file (fxceless PR
+/// #1240). Only memory kept for reuse goes: nothing a list, a slot or a
+/// copy holds.
+pub(crate) fn ram_trim_bytes() -> Option<u64> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_RAM_TRIM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb << 20)
+    })
+}
+
+/// Whether available physical RAM or commit is below `VICTORY_RAM_TRIM_MB`
+/// ([`ram_trim_bytes`]).
+pub(crate) fn ram_pressure() -> bool {
+    let Some(limit) = ram_trim_bytes() else {
+        return false;
+    };
+    available_memory().is_some_and(|(physical, commit)| physical.min(commit) < limit)
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -201,8 +229,9 @@ fn sweep() {
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
+    let interval = if ram_pressure() { 500 } else { 1000 };
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -215,6 +244,7 @@ fn sweep() {
     crate::texture::let_go_idle(idle_ms);
     crate::resource::let_go_idle();
     crate::placed::let_go_idle();
+    crate::list::let_go_idle();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -2551,9 +2581,18 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes, marked): declaring them again
+    /// would change nothing ([`HostList::defer_gpu_write`]).
+    gpu_written: std::collections::HashSet<(usize, usize, usize, bool)>,
+    /// Scratch memory [`HostList::fill_scratch`] fills since the list last
+    /// wrote title memory (source, bytes): its host address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -2588,6 +2627,14 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// The steps recorded last write title memory: what was brought up to
+    /// date, or declared written, before them is not any more.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -2876,6 +2923,96 @@ fn inflight_tickets_landed(plans: &[&CardPlan]) {
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
 fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+}
+
+/// Experimental: merge only directly adjacent readback commands. Keep the
+/// original piece list for merging, fence tracking, and bookkeeping.
+fn coalesce_readbacks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_COALESCE").is_some_and(|v| v == "1"))
+}
+
+/// Each tuple is (source, source start, source end, destination offset).
+/// Do not reorder pieces or bridge gaps in either address space. Different
+/// resources may alias, but are deliberately never joined.
+fn readback_runs<T, K: Eq>(
+    pieces: impl Iterator<Item = (T, usize, usize, u64)>,
+    key: impl Fn(&T) -> K,
+    enabled: bool,
+) -> impl Iterator<Item = (T, usize, usize, u64)> {
+    let mut pieces = pieces.peekable();
+    std::iter::from_fn(move || {
+        let (source, lo, mut hi, at) = pieces.next()?;
+        if enabled {
+            while let Some((next_source, next_lo, next_hi, next_at)) = pieces.peek() {
+                if hi != *next_lo || hi <= lo || *next_hi <= *next_lo
+                    || at.checked_add((hi - lo) as u64) != Some(*next_at)
+                    || key(&source) != key(next_source)
+                {
+                    break;
+                }
+                hi = *next_hi;
+                let _ = pieces.next();
+            }
+        }
+        Some((source, lo, hi, at))
+    })
+}
+
+#[cfg(test)]
+mod readback_run_tests {
+    use super::readback_runs;
+
+    #[test]
+    fn merges_only_exact_adjacency_in_both_address_spaces() {
+        let pieces = [(1, 0, 64, 0), (1, 64, 128, 64), (1, 160, 192, 128),
+                      (1, 192, 256, 192), (2, 256, 320, 256), (2, 320, 384, 320),
+                      (2, 128, 192, 384), (2, 192, 256, 448)];
+        let got: Vec<_> = readback_runs(pieces.into_iter(), |i| *i, true).collect();
+        assert_eq!(got, [(1, 0, 128, 0), (1, 160, 192, 128),
+                         (1, 192, 256, 192), (2, 256, 384, 256), (2, 128, 256, 384)]);
+        assert_eq!(readback_runs(pieces.into_iter(), |i| *i, false).collect::<Vec<_>>(), pieces);
+    }
+
+    #[test]
+    fn byte_exact_for_varied_order_and_resource_boundaries() {
+        let mut seed = 0x69f7e9b17u64;
+        for _ in 0..256 {
+            let mut pieces = Vec::new();
+            let mut dst = 0u64;
+            let mut src = 0usize;
+            let mut key = 0u32;
+            for _ in 0..128 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed.is_multiple_of(5) {
+                    src = (seed % 2048) as usize;
+                }
+                if seed.is_multiple_of(7) {
+                    key = (key + 1) % 4;
+                }
+                let len = 1 + (seed % 128) as usize;
+                pieces.push((key, src, src + len, dst));
+                src += len;
+                dst += len as u64;
+            }
+            let expand = |runs: &[(u32, usize, usize, u64)]| {
+                runs.iter().flat_map(|&(key, lo, hi, dst)| {
+                    (lo..hi).map(move |i| (key, i, dst + (i - lo) as u64))
+                }).collect::<Vec<_>>()
+            };
+            let runs: Vec<_> = readback_runs(pieces.iter().copied(), |i| *i, true).collect();
+            assert_eq!(expand(&runs), expand(&pieces));
+        }
+    }
+
+    #[test]
+    fn adjacent_64k_pieces_reduce_command_count_without_reducing_bytes() {
+        let pieces: Vec<_> = (0..1024usize).map(|i| (0, i * 65536, (i + 1) * 65536, (i * 65536) as u64)).collect();
+        let runs: Vec<_> = readback_runs(pieces.iter().copied(), |i| *i, true).collect();
+        assert_eq!(runs, [(0, 0, 64 * 1024 * 1024, 0)]);
+    }
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -3195,14 +3332,55 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Compact the sorted intervals in place. The write cursor never
+    // advances past the read cursor, so unread input cannot be overwritten.
+    let mut kept = 0;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if kept != 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(kept);
+}
+
+#[cfg(test)]
+mod interval_compaction_tests {
+    #[test]
+    fn in_place_interval_compaction_matches_allocating_reference() {
+        let mut seed = 0x5e4db6d3u64;
+        for n in [0usize, 1, 17, 128, 4096] {
+            for _ in 0..32 {
+                let mut ranges = Vec::new();
+                let mut more = Vec::new();
+                for _ in 0..n {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let from = (seed % 8192) as usize;
+                    more.push((from, from + ((seed >> 32) % 32) as usize));
+                }
+                for half in more.chunks(n.div_ceil(2).max(1)) {
+                    let mut expected = ranges.clone();
+                    expected.extend(half.iter().copied().filter(|r| r.0 < r.1));
+                    expected.sort_unstable();
+                    let mut reference: Vec<(usize, usize)> = Vec::new();
+                    for (from, to) in expected {
+                        match reference.last_mut() {
+                            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                            _ => reference.push((from, to)),
+                        }
+                    }
+                    super::join_ranges(&mut ranges, half.iter().copied());
+                    assert_eq!(ranges, reference);
+                }
+            }
+        }
+    }
+
 }
 
 /// Whether anything is in the air.
@@ -4396,6 +4574,14 @@ fn late_line(frames: f64) -> [f64; 3] {
             bytes / (1 << 20) as f64
         );
     }
+    {
+        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+            found[0],
+            found[1]
+        );
+    }
     figures
 }
 
@@ -4587,6 +4773,14 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     d.checked_add(n) == Some(dst)
         && s.checked_add(n) == Some(src)
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// Whether a range shaders write is declared once until the list next
+/// writes title memory ([`HostList::defer_gpu_write`]; on unless
+/// `VICTORY_DECLARE_ONCE=0`).
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -5820,8 +6014,8 @@ impl Host {
                     // title's either way.
                     let after = second.order_done();
                     let copy = second.down.list()?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    for (shadow, lo, hi, at) in readback_runs(pieces.iter().map(|(s, lo, hi, at)| (s, *lo, *hi, *at)), |s| std::sync::Arc::as_ptr(s), coalesce_readbacks()) {
+                        copy.1.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
                     second.down.wait(job, event)?;
@@ -5840,8 +6034,8 @@ impl Host {
                 }
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for (shadow, lo, hi, at) in readback_runs(pieces.iter().map(|(s, lo, hi, at)| (s, *lo, *hi, *at)), |s| std::sync::Arc::as_ptr(s), coalesce_readbacks()) {
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -6257,7 +6451,7 @@ impl Host {
                     // relay uses, in the plainest run there is.
                     if let Some(second) = crate::queue2::second().filter(|s| s.fetches()) {
                         let copy = second.down.list()?;
-                        for &(i, lo, hi, at) in &pieces {
+                        for (i, lo, hi, at) in readback_runs(pieces.iter().copied(), |i| *i, coalesce_readbacks()) {
                             copy.1.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                         }
                         let job = second.down.send(copy, &[(&self.fence, *submitted)], total)?;
@@ -6270,7 +6464,7 @@ impl Host {
                     }
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    for (i, lo, hi, at) in readback_runs(pieces.iter().copied(), |i| *i, coalesce_readbacks()) {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
@@ -7906,7 +8100,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// With [`fill_on_card`]: `len` bytes of the host copy `shadow` from title
@@ -7968,6 +8162,25 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// The host address of `len` bytes of scratch memory that hold the title
+    /// memory at `src` as of the list's submission: one fill for every ask
+    /// until the list next writes title memory (after VIctory-NVIDIA
+    /// c96525db; a root constant buffer the host cannot read in place, not
+    /// 256-byte aligned, was filled again for every draw that bound it).
+    /// The scratch is this host list's own, so a part after a cut fills
+    /// anew.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let known = self.deferred().filled.get(&key).copied();
+        if known.is_some() {
+            return known;
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -7995,9 +8208,17 @@ impl HostList {
         len: usize,
         marked: bool,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        // Declared once until the list next writes title memory (after
+        // VIctory-NVIDIA b32fb997; `VICTORY_DECLARE_ONCE=0`: every time):
+        // the dispatches of a frame declared the same few ranges thousands
+        // of times, each step a flush of its copy's pending refresh and a
+        // snapshot on the submitting thread. The ranges and their order
+        // stay what they were.
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len, marked);
+        if deferred.gpu_written.insert(key) || !declare_once() {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        }
     }
 
     /// Notes that a draw or dispatch in this list bound `SLOT_VIEW_WRITES`.
@@ -8280,6 +8501,28 @@ impl HostList {
     }
 
     /// Keeps `object` alive until the list is reset.
+    /// The list binds a pipeline: it and its root signature are kept until
+    /// the list is reset, and its name noted, the first time only (after
+    /// VIctory-NVIDIA ab86ef7f: two interface queries, three locks and a
+    /// name looked up at every change of pipeline). A kept pipeline's
+    /// address names no other while the list holds it. With the card's
+    /// clock per pipeline (`crate::cardmeter`) every bind still ends the
+    /// span before it.
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(pso.clone().into());
+                deferred.kept.push(root.clone().into());
+            }
+            first
+        };
+        if first || crate::cardmeter::pipelines() {
+            self.used_pipeline(name);
+        }
+    }
+
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
@@ -8301,8 +8544,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
