@@ -20,6 +20,11 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+/// Packed dot-product lowering (`v_dot*`), a child module so it shares the
+/// emitter's state without growing this file.
+#[path = "dot.rs"]
+mod dot;
+
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
@@ -238,8 +243,8 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
-/// of its mantissa, without the sign, so `legacyF16ToF32` widens them
-/// exactly, denormals, infinities and NaNs included.
+/// of its mantissa, without the sign (a typed load widens their
+/// infinities and NaNs through a finite half, payload kept).
 fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
@@ -4705,6 +4710,11 @@ impl<'a> Lower<'a> {
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
         };
+        self.lane_bit_at(at, lane, lo, hi)
+    }
+
+    /// Lane `lane`'s bit of the mask `lo`, `hi` (wave64).
+    fn lane_bit_at(&mut self, at: usize, lane: V, lo: V, hi: Option<V>) -> V {
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -5318,6 +5328,31 @@ impl<'a> Lower<'a> {
             // edge, and discarded pixels), which only quad reads see.
             let r = if mesh_quad || quad && self.s.pixel {
                 self.quad_pick(x, src)
+            } else if self.s.threads.is_some()
+                && self.s.mesh.is_none()
+                && self.exchange.is_none()
+                && self.twin.is_none()
+                && !self.x.native.wave64
+            {
+                // A console lane sends its value only while its EXEC bit is
+                // set: a source lane masked by EXEC, or absent from the host
+                // wave, reads zero, where the host's read of it is undefined
+                // (justr4mzi 6ba165b2, fxceless #1030). Console wave32 only,
+                // where the host lane is the console lane; the wave64 forms
+                // keep the plain read.
+                let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                let lo = self.s.m.extract(c, ballot, 0);
+                let active = self.lane_bit_at(c, src, lo, None);
+                // The host read stays defined for an inactive source.
+                let src = self.s.m.select(c, active, src, lane);
+                let read = self.read_lane(x, src);
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, active, read, zero)
             } else {
                 self.read_lane(x, src)
             };
@@ -6997,10 +7032,25 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::Shl, field, sh)
                         }
                     };
+                    // GFX10 typed loads keep even a signaling NaN's payload,
+                    // which the host's widening may quiet: a half with
+                    // exponent 31 is widened with exponent 15 (finite), and
+                    // the high exponent bit is put back in the f32 result
+                    // (justr4mzi a15e95d8, fxceless #1019).
+                    let exp_mask = self.s.m.i32(0x7c00);
+                    let exp = self.s.m.bin(c, Bin::And, h, exp_mask);
+                    let special = self.s.m.cmp(c, pred::EQ, exp, exp_mask);
+                    let high_bit = self.s.m.i32(0x4000);
+                    let zero = self.s.m.i32(0);
+                    let restore = self.s.m.select(c, special, high_bit, zero);
+                    let finite = self.s.m.bin(c, Bin::Xor, h, restore);
                     let f = self
                         .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-                    float(self, f)
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[finite]);
+                    let bits = float(self, f);
+                    let shift = self.s.m.i32(16);
+                    let restore = self.s.m.bin(c, Bin::Shl, restore, shift);
+                    self.s.m.bin(c, Bin::Or, bits, restore)
                 }
             };
             out.push(x);
@@ -7790,6 +7840,9 @@ impl<'a> Lower<'a> {
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
+        }
+        if name.starts_with("v_dot") {
+            return self.dot_product(inst, name, guard);
         }
         if let Some(r) = self.valu_f64(inst, name, guard) {
             return r;
@@ -9252,7 +9305,11 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
+        let saturates = matches!(
+            op,
+            "add_u16" | "sub_u16" | "mad_u16" | "add_i16" | "sub_i16" | "mad_i16"
+        );
+        if v.omod != 0 || !float && ((v.clamp && !saturates) || v.neg != 0 || v.neg_hi != 0) {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
@@ -9302,7 +9359,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 let k15 = self.s.m.i32(15);
-                match op {
+                let r = match op {
                     "add_u16" | "add_i16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "sub_u16" | "sub_i16" => self.s.m.bin(c, Bin::Sub, xs[0], xs[1]),
                     "mul_lo_u16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
@@ -9334,6 +9391,34 @@ impl<'a> Lower<'a> {
                         let t = self.s.m.cmp(c, p, xs[0], xs[1]);
                         self.s.m.select(c, t, xs[0], xs[1])
                     }
+                };
+                if v.clamp && saturates {
+                    match op {
+                        // Unsigned: add/mad fit in u32 (max 65535*65535+65535 <= u32::MAX);
+                        // sub is in [-65535, 65535] so signed < 0 catches underflow.
+                        "add_u16" | "mad_u16" => {
+                            let hi = self.s.m.i32(0xFFFF);
+                            let over = self.s.m.cmp(c, pred::IUGT, r, hi);
+                            self.s.m.select(c, over, hi, r)
+                        }
+                        "sub_u16" => {
+                            let z = self.s.m.i32(0);
+                            let under = self.s.m.cmp(c, pred::SLT, r, z);
+                            self.s.m.select(c, under, z, r)
+                        }
+                        // Signed: operands are sign-extended i16 in i32, so add/sub/mad
+                        // never wrap i32 (|r| <= 32768*32768 + 32768 < 2^31).
+                        _ => {
+                            let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
+                            let hi = self.s.m.i32(i32::from(i16::MAX) as u32);
+                            let under = self.s.m.cmp(c, pred::SLT, r, lo);
+                            let t = self.s.m.select(c, under, lo, r);
+                            let over = self.s.m.cmp(c, pred::SGT, t, hi);
+                            self.s.m.select(c, over, hi, t)
+                        }
+                    }
+                } else {
+                    r
                 }
             };
             let m = self.s.m.i32(0xFFFF);

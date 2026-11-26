@@ -2303,9 +2303,8 @@ fn mixed_precision_matches_the_hardware() {
 
 /// `v_dot4_i32_i8` and `v_dot4c_i32_i8`: four signed byte products and the
 /// accumulator (RDNA2 ISA), with `op_sel_hi` as assemblers write it (all
-/// set) and clear. The lowering refuses both.
+/// set) and clear (`dot.rs`, DXIL `dot4AddPacked`).
 #[test]
-#[ignore = "defect: the lowering refuses v_dot4_i32_i8 and v_dot4c_i32_i8"]
 fn byte_dot_products_match_the_hardware() {
     let bytes = [
         0u32,

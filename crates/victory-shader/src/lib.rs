@@ -53,6 +53,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/halves.rs"),
         include_str!("emit/descriptor_tests.rs"),
         include_str!("emit/diff_tests.rs"),
+        include_str!("emit/dot.rs"),
         include_str!("emit/float64.rs"),
         include_str!("emit/flow_tests.rs"),
         include_str!("emit/host.rs"),

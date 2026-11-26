@@ -88,6 +88,8 @@ mod tdr;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use census::title_memory_reserved;

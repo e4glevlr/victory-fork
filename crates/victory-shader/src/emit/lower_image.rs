@@ -38,7 +38,8 @@ impl Lower<'_> {
             // sized only.
             3 if name.starts_with("image_sample")
                 || name.starts_with("image_gather")
-                || name == "image_get_resinfo" =>
+                || name == "image_get_resinfo"
+                || (name == "image_get_lod" && self.s.pixel) =>
             {
                 (5, 3)
             }
@@ -353,8 +354,10 @@ impl Lower<'_> {
                     l.as_float(x)
                 }
             };
-            if kind == 5 && (*unorm || op == 81) {
-                return Err("a cube sample with texel coordinates or a level query");
+            // A cube's level query reads its face coordinates and face as a
+            // sample does (justr4mzi 640262ee, fxceless #1024).
+            if kind == 5 && *unorm {
+                return Err("a cube sample with texel coordinates");
             }
             // A level query takes no array slice (the code may pass anything
             // there; DXC leaves that coordinate undefined).
