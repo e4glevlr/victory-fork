@@ -4298,15 +4298,34 @@ mod tests {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let again: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        // Fresh slots: the newest write first and the oldest next, in turns.
+        let mut fresh_order = Vec::with_capacity(fresh.len());
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        // The two kinds in turns, a slot looked at before first
+        // (`VICTORY_FAIR_DUE`), or all those looked at before first.
+        let mut order = Vec::with_capacity(again.len() + fresh_order.len());
+        if fair_due() {
+            let (mut a, mut b) = (again.into_iter(), fresh_order.into_iter());
+            loop {
+                let (x, y) = (a.next(), b.next());
+                if x.is_none() && y.is_none() {
+                    break;
+                }
+                order.extend(x);
+                order.extend(y);
+            }
+        } else {
+            order.extend(again);
+            order.extend(fresh_order);
         }
         order.truncate(max);
         order

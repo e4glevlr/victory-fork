@@ -11,7 +11,7 @@
   </defs>
   <rect x="0.5" y="0.5" width="1079" height="519" rx="12" fill="#0d1117" stroke="#21262d"/>
   <text x="36" y="42" font-size="15" font-weight="700" class="sans fg">VIctory Fork<tspan font-weight="400" class="mut" dx="10">Xbox Series → Host D3D12</tspan></text>
-  <text x="1044" y="42" text-anchor="end" font-size="11.5" class="mono mut">rtx3060ti/grand-merge · 362 commits · 2026-11-26</text>
+  <text x="1044" y="42" text-anchor="end" font-size="11.5" class="mono mut">rtx3060ti/grand-merge · 363 commits · 2026-11-26</text>
   <text x="36" y="118" font-size="54" font-weight="800" letter-spacing="-1.5" class="sans fg">65.6%<tspan font-size="17" font-weight="500" letter-spacing="0" class="sans mut" dx="14">to playable</tspan></text>
   <text x="36" y="146" font-size="13.5" class="sans sec">In-world renders at 9.6 / 30 FPS — blocked by <tspan fill="#f85149" font-weight="600">RT shadow lighting</tspan></text>
   <g>
@@ -94,17 +94,17 @@
   <text x="36" y="484" font-size="11" class="mono dim">PS 100% · VS 100% · CS 99.8% · MS 99.2% · 301 flags</text>
   <line x1="438" y1="384" x2="438" y2="492" stroke="#21262d"/>
   <text x="464" y="396" font-size="12.5" font-weight="600" class="sans fg">Recent Commits</text>
-  <text x="1044" y="396" text-anchor="end" font-size="11" class="mono mut">Last 60: Shaders 48% · GPU 32% · Other 20%</text>
-  <text x="464" y="421" font-size="11" fill="#38bdf8" class="mono">f9b0b122</text>
+  <text x="1044" y="396" text-anchor="end" font-size="11" class="mono mut">Last 60: Shaders 47% · GPU 32% · Other 21%</text>
+  <text x="464" y="421" font-size="11" fill="#38bdf8" class="mono">70c27949</text>
   <text x="530" y="421" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="421" font-size="12" class="sans sec">Phase 3: P2 exact CPU/GPU dedups, lookup cache &amp; 16GB RAM trimm…</text>
-  <text x="464" y="443" font-size="11" fill="#38bdf8" class="mono">61ea52a8</text>
+  <text x="576" y="421" font-size="12" class="sans sec">Phase 4: opt-in SH ambient, loader hooks &amp; RTX 3060 Ti launcher</text>
+  <text x="464" y="443" font-size="11" fill="#38bdf8" class="mono">f9b0b122</text>
   <text x="530" y="443" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="443" font-size="12" class="sans sec">Phase 2: P1 water readback, RT variants, depth bounds &amp; Wave32/…</text>
-  <text x="464" y="465" font-size="11" fill="#38bdf8" class="mono">ec14e410</text>
+  <text x="576" y="443" font-size="12" class="sans sec">Phase 3: P2 exact CPU/GPU dedups, lookup cache &amp; 16GB RAM trimm…</text>
+  <text x="464" y="465" font-size="11" fill="#38bdf8" class="mono">61ea52a8</text>
   <text x="530" y="465" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="465" font-size="12" class="sans sec">Phase 1: P0 NVIDIA heap, VRAM &amp; descriptor safety</text>
-  <text x="464" y="487" font-size="11" fill="#38bdf8" class="mono">f9b1ce11</text>
+  <text x="576" y="465" font-size="12" class="sans sec">Phase 2: P1 water readback, RT variants, depth bounds &amp; Wave32/…</text>
+  <text x="464" y="487" font-size="11" fill="#38bdf8" class="mono">ec14e410</text>
   <text x="530" y="487" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="487" font-size="12" class="sans sec">Phase 0: 3060 Ti engineering rules, grand-merge plan and README…</text>
+  <text x="576" y="487" font-size="12" class="sans sec">Phase 1: P0 NVIDIA heap, VRAM &amp; descriptor safety</text>
 </svg>
