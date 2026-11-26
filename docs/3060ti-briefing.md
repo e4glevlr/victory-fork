@@ -206,7 +206,7 @@ New shader lowering (always on, exact): DP4A `dot4AddPacked` for `v_dot4*`/`v_do
 
 `scripts/run-3060ti.ps1` (`-Profile Quality` default, `-Profile Survival8GB`, `-SeriesS`, `-DryRun`). Two deviations from the plan's sign-off profile:
 - `VICTORY_DYNAMIC_SLOTS` is not set by default (`-DynamicSlots 524288`): shaders clamp view indices only to the heap's null slot, so a view picked by index past the slots kept in place reads a dynamic slot. Use it only if the log shows "no free dynamic descriptor slots", and compare the picture.
-- `VICTORY_RAM_TRIM_MB` is `2048`, not `12288`: it is a threshold of *available* memory, and a 16 GB machine running the title is nearly always below 12 GB available, which would empty the pools every 500 ms.
+- `VICTORY_RAM_TRIM_MB` is not set (`-RamTrimMB 300` when `crashes.log` reports error 1455): it is a threshold of *available* memory, and the RTX 3060 Ti machine (16 GB) sits at 1.5–2 GB available with the title running. At the first launcher default of `2048` the pools were emptied every 500 ms and the A/B (2026-11-26, `scripts/bench.ps1` window 30–105 s, warm caches) measured 6.8 fps against 8.5 and 8.7 fps with it off, the base `8a63f368` at 8.1–9.0. An independent 8 GB / 16 GB laptop measurement found the same at 2048 and no loss at 300.
 
 ### Still to verify on the RTX 3060 Ti
 

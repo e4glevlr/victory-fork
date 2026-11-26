@@ -19,8 +19,6 @@ with only the switches that save memory or time without changing a pixel:
                                  (#1237 with #1245)
     VICTORY_BIND_CACHE=1         the same render targets are not set again
     VICTORY_DECLARE_ONCE=1       a range shaders write is declared once
-    VICTORY_RAM_TRIM_MB=2048     below 2 GB of free RAM or commit, the reuse
-                                 pools are emptied (Windows error 1455)
     VICTORY_NO_WATCHDOG=1        the title's 30-second freeze kill stays away
                                  while shaders compile
 
@@ -45,6 +43,11 @@ Not set by any profile, and why:
   (-Ambient 0.6 for the flat one, -Ambient sh for the one estimated from the
   frame). It changes the lighting, so it is asked for by hand.
 - VICTORY_RENDER_SCALE: renders below the output size; softer.
+- VICTORY_RAM_TRIM_MB: a 16 GB machine running the title sits at 1.5-2 GB
+  of free RAM, so a threshold of 2048 empties the reuse pools every 500 ms
+  and costs about a fifth of the frame rate (6.8 against 8.5-8.7 fps on the
+  RTX 3060 Ti). Use -RamTrimMB 300 only when crashes.log reports Windows
+  error 1455 (commit exhausted).
 
 .EXAMPLE
 .\scripts\run-3060ti.ps1
@@ -66,8 +69,8 @@ param(
     [string]$Victory,
     # VICTORY_DYNAMIC_SLOTS (0: not set; see the description).
     [int]$DynamicSlots = 0,
-    # VICTORY_RAM_TRIM_MB (0: not set).
-    [int]$RamTrimMB = 2048,
+    # VICTORY_RAM_TRIM_MB (0: not set; see the description).
+    [int]$RamTrimMB = 0,
     # VICTORY_AMBIENT: a level for the flat stand-in, or sh (not set if empty).
     [string]$Ambient = '',
     # More switches, or other values: @{ NAME = 'value' } or 'NAME=value'
