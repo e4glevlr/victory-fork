@@ -11,7 +11,7 @@
   </defs>
   <rect x="0.5" y="0.5" width="1079" height="519" rx="12" fill="#0d1117" stroke="#21262d"/>
   <text x="36" y="42" font-size="15" font-weight="700" class="sans fg">VIctory Fork<tspan font-weight="400" class="mut" dx="10">Xbox Series → Host D3D12</tspan></text>
-  <text x="1044" y="42" text-anchor="end" font-size="11.5" class="mono mut">rtx3060ti/grand-merge · 358 commits · 2026-11-26</text>
+  <text x="1044" y="42" text-anchor="end" font-size="11.5" class="mono mut">rtx3060ti/grand-merge · 359 commits · 2026-11-26</text>
   <text x="36" y="118" font-size="54" font-weight="800" letter-spacing="-1.5" class="sans fg">65.6%<tspan font-size="17" font-weight="500" letter-spacing="0" class="sans mut" dx="14">to playable</tspan></text>
   <text x="36" y="146" font-size="13.5" class="sans sec">In-world renders at 9.6 / 30 FPS — blocked by <tspan fill="#f85149" font-weight="600">RT shadow lighting</tspan></text>
   <g>
@@ -80,31 +80,31 @@
   </g>
   <line x1="36" y1="368" x2="1044" y2="368" stroke="#21262d"/>
   <text x="36" y="396" font-size="12.5" font-weight="600" class="sans fg">Codebase &amp; Shaders</text>
-  <text x="412" y="396" text-anchor="end" font-size="11" class="mono mut">169.3k LOC · 1,064 tests</text>
+  <text x="412" y="396" text-anchor="end" font-size="11" class="mono mut">169.5k LOC · 1,067 tests</text>
   <clipPath id="locClip"><rect x="36" y="408" width="376" height="8" rx="4"/></clipPath>
   <g clip-path="url(#locClip)">
-    <rect x="36.0" y="408" width="152.0" height="8" fill="#38bdf8"/>
-    <rect x="187.5" y="408" width="132.4" height="8" fill="#79c0ff"/>
-    <rect x="319.5" y="408" width="54.7" height="8" fill="#3b5875"/>
+    <rect x="36.0" y="408" width="152.4" height="8" fill="#38bdf8"/>
+    <rect x="187.9" y="408" width="132.3" height="8" fill="#79c0ff"/>
+    <rect x="319.6" y="408" width="54.6" height="8" fill="#3b5875"/>
     <rect x="373.7" y="408" width="38.8" height="8" fill="#263242"/>
   </g>
   <text x="36" y="434" font-size="11" class="mono mut">gpu 40% · shader 35% · hle 14% · other 11%</text>
   <text x="36" y="464" font-size="11.5" font-weight="600" class="sans sec">SM 6.6 / Wave32</text>
   <text x="412" y="464" text-anchor="end" font-size="11" font-weight="600" fill="#3fb950" class="mono">25,682 / 25,953 (99.0%)</text>
-  <text x="36" y="484" font-size="11" class="mono dim">PS 100% · VS 100% · CS 99.8% · MS 99.2% · 283 flags</text>
+  <text x="36" y="484" font-size="11" class="mono dim">PS 100% · VS 100% · CS 99.8% · MS 99.2% · 287 flags</text>
   <line x1="438" y1="384" x2="438" y2="492" stroke="#21262d"/>
   <text x="464" y="396" font-size="12.5" font-weight="600" class="sans fg">Recent Commits</text>
-  <text x="1044" y="396" text-anchor="end" font-size="11" class="mono mut">Last 60: Shaders 50% · GPU 33% · Other 17%</text>
-  <text x="464" y="421" font-size="11" fill="#38bdf8" class="mono">8a63f368</text>
+  <text x="1044" y="396" text-anchor="end" font-size="11" class="mono mut">Last 60: Shaders 48% · GPU 33% · Other 19%</text>
+  <text x="464" y="421" font-size="11" fill="#38bdf8" class="mono">f9b1ce11</text>
   <text x="530" y="421" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="421" font-size="12" class="sans sec">Merge v4.3 (#1205, #1147, #1206, #1210, #1241, #1214, #1044, #1…</text>
-  <text x="464" y="443" font-size="11" fill="#38bdf8" class="mono">943e7ee0</text>
+  <text x="576" y="421" font-size="12" class="sans sec">Phase 0: 3060 Ti engineering rules, grand-merge plan and README…</text>
+  <text x="464" y="443" font-size="11" fill="#38bdf8" class="mono">8a63f368</text>
   <text x="530" y="443" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="443" font-size="12" class="sans sec">Port overnight P0/P1/P2 GPU/HLE fixes (#1205, #1147, #1206, #12…</text>
-  <text x="464" y="465" font-size="11" fill="#38bdf8" class="mono">33999da3</text>
+  <text x="576" y="443" font-size="12" class="sans sec">Merge v4.3 (#1205, #1147, #1206, #1210, #1241, #1214, #1044, #1…</text>
+  <text x="464" y="465" font-size="11" fill="#38bdf8" class="mono">943e7ee0</text>
   <text x="530" y="465" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="465" font-size="12" class="sans sec">Merge v4.3 (#860, #462) into the shader PRs</text>
-  <text x="464" y="487" font-size="11" fill="#38bdf8" class="mono">0003654b</text>
+  <text x="576" y="465" font-size="12" class="sans sec">Port overnight P0/P1/P2 GPU/HLE fixes (#1205, #1147, #1206, #12…</text>
+  <text x="464" y="487" font-size="11" fill="#38bdf8" class="mono">33999da3</text>
   <text x="530" y="487" font-size="11" class="mono dim">11-26</text>
-  <text x="576" y="487" font-size="12" class="sans sec">Tests: the semantics probes give a one-dimensional dispatch&apos;s g…</text>
+  <text x="576" y="487" font-size="12" class="sans sec">Merge v4.3 (#860, #462) into the shader PRs</text>
 </svg>

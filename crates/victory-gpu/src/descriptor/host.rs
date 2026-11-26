@@ -19,9 +19,10 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
-    /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps (more on a
+    /// capped host heap with `VICTORY_DYNAMIC_SLOTS`, [`dynamic_slots`]),
+    /// none in sampler heaps. (Upstream falls back to 2^16 on a capped host
+    /// heap; ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -218,6 +219,22 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// whose first level with memory changed since a texture pass last took
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again, those of them made while a submission was in flight, and passes
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether view slots of textures with levels on demand are made again
+/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
+/// off by default: at every texture pass, as before). A texture then
+/// shows its new level a pass or more later. After fork pull request
+/// #1219, whose author lost the device with slots rewritten under lists
+/// already sent; whether that is behind the losses here is not known.
+fn views_remade_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+}
 
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
@@ -665,6 +682,56 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::due`]; on unless
+/// `VICTORY_FAIR_DUE=0`).
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
+/// Up to `n` of the due slots `fresh` (frame written, index, write number)
+/// with their write numbers, the newest write first and the oldest next, in
+/// turns ([`TextureQueue::due`]). Of a backlog longer than `n` only its two
+/// ends are sorted; its middle is not served this pass.
+fn newest_and_oldest(mut fresh: Vec<(u64, u32, u64)>, n: usize) -> Vec<(u32, u64)> {
+    let mut newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+    let mut order = Vec::with_capacity(n.min(fresh.len()));
+    if fresh.len() <= n {
+        fresh.sort_unstable_by(&mut newest_first);
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old {
+            order.push((fresh[new].1, fresh[new].2));
+            new += 1;
+            if new < old {
+                old -= 1;
+                order.push((fresh[old].1, fresh[old].2));
+            }
+        }
+    } else if n > 0 {
+        let newest_count = n.div_ceil(2);
+        let oldest_count = n / 2;
+        fresh.select_nth_unstable_by(newest_count, &mut newest_first);
+        let mut oldest = fresh.split_off(newest_count);
+        if oldest_count > 0 {
+            let middle = oldest.len() - oldest_count;
+            oldest.select_nth_unstable_by(middle, &mut newest_first);
+            oldest.drain(..middle);
+            oldest.sort_unstable_by(|a, b| newest_first(b, a));
+        } else {
+            oldest.clear();
+        }
+        fresh.sort_unstable_by(&mut newest_first);
+        for index in 0..newest_count {
+            order.push((fresh[index].1, fresh[index].2));
+            if index < oldest_count {
+                order.push((oldest[index].1, oldest[index].2));
+            }
+        }
+    }
+    order
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -708,14 +775,20 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in turns:
+    ///   slot order served the low slots of a backlog of 25,000-40,000
+    ///   while the textures of the shot on screen waited (run 52: 98% of
+    ///   the drawn pixels had no colour texture in the first 3D frames);
+    /// - the two kinds one after the other, a slot looked at before first
+    ///   (`VICTORY_FAIR_DUE=0`: all those looked at before first, as
+    ///   before). With them all first, a backlog of thousands of slots
+    ///   streaming in a part at a time filled every pass in the opening
+    ///   cutscene, which the pass's time then cut, and slots never looked
+    ///   at waited 300 to 1,500 frames: faces whose textures are picked by
+    ///   index read an empty slot (black) or an older view (red, noise).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         if max == 0 {
             return Vec::new();
@@ -735,42 +808,25 @@ impl TextureQueue {
             again.truncate(max);
         }
         again.sort_unstable_by(&mut newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let remaining = max - order.len();
-        if fresh.len() <= remaining {
-            fresh.sort_unstable_by(&mut newest_first);
-            let (mut new, mut old) = (0, fresh.len());
-            while new < old {
-                order.push((fresh[new].1, fresh[new].2));
-                new += 1;
-                if new < old {
-                    old -= 1;
-                    order.push((fresh[old].1, fresh[old].2));
-                }
-            }
-        } else if remaining > 0 {
-            // Fresh slots alternate newest and oldest. Select just those two
-            // ends; the middle of a large backlog is not returned this pass.
-            let newest_count = remaining.div_ceil(2);
-            let oldest_count = remaining / 2;
-            fresh.select_nth_unstable_by(newest_count, &mut newest_first);
-            let mut oldest = fresh.split_off(newest_count);
-            if oldest_count > 0 {
-                let middle = oldest.len() - oldest_count;
-                oldest.select_nth_unstable_by(middle, &mut newest_first);
-                oldest.drain(..middle);
-                oldest.sort_unstable_by(|a, b| newest_first(b, a));
-            } else {
-                oldest.clear();
-            }
-            fresh.sort_unstable_by(&mut newest_first);
-            for index in 0..newest_count {
-                order.push((fresh[index].1, fresh[index].2));
-                if index < oldest_count {
-                    order.push((oldest[index].1, oldest[index].2));
-                }
-            }
+        let mut again = again.into_iter().map(|(_, index, write)| (index, write));
+        let fair = fair_due();
+        // In turns with the slots looked at before, fresh ones may fill the
+        // whole pass; after them all, only what they leave.
+        let room = if fair { max } else { max - again.len() };
+        let mut fresh = newest_and_oldest(fresh, room).into_iter();
+        if !fair {
+            return again.chain(fresh).collect();
         }
+        let mut order = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        while order.len() < max {
+            let (a, b) = (again.next(), fresh.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
+        }
+        order.truncate(max);
         order
     }
 
@@ -1077,6 +1133,45 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The dynamic slots of a view heap whose null slot is `null`: [`DYNAMIC`],
+/// or on a host heap capped at [`PORTABLE_VIEWS`] (NVIDIA) as many as
+/// `VICTORY_DYNAMIC_SLOTS` asks ([`capped_dynamic_slots`]; after
+/// VIctory-NVIDIA a9632bc8). There they come out of the title's slots kept
+/// in place: a table reaching past those is made afresh in dynamic slots
+/// (`Draw::tables`), but a view a shader picks by index past them reads
+/// whatever dynamic slot sits at that index, so the switch is off unless
+/// set. With 2^18 a frame of the world on such a host had 1,100-4,800 of
+/// 12,000-16,600 tables refused (each a dropped draw); 524,288 asked
+/// (clamped to half the heap) refused 0-33.
+fn dynamic_slots(null: u32) -> u32 {
+    if null == 0 || null >= PORTABLE_VIEWS {
+        return DYNAMIC;
+    }
+    static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAPPED.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok();
+        let slots = capped_dynamic_slots(asked.as_deref(), null);
+        if slots != DYNAMIC {
+            tracing::warn!(
+                slots,
+                title_in_place = null - slots,
+                "VICTORY_DYNAMIC_SLOTS: more dynamic descriptor slots on a capped view heap; title views picked by index past those kept in place read dynamic slots"
+            );
+        }
+        slots
+    })
+}
+
+/// [`dynamic_slots`] on a capped heap whose null slot is `null`: the count
+/// `asked`, at least [`DYNAMIC`] and at most half the heap.
+fn capped_dynamic_slots(asked: Option<&str>, null: u32) -> u32 {
+    let most = (null / 2).max(DYNAMIC);
+    asked
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DYNAMIC)
+        .clamp(DYNAMIC, most)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1097,7 +1192,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1109,6 +1203,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1188,8 +1283,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             marks,
@@ -1341,7 +1436,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -1688,7 +1783,22 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         if self.sampler {
+            return 0;
+        }
+        // The slots made again here are live slots of the heap the card
+        // reads, and the making is the layer's own, at a moment the title
+        // knows nothing of: a list already sent may be reading a slot while
+        // it is written (Direct3D 12 asks that a descriptor a submitted
+        // list reads is left alone until the list has run). Counted always;
+        // with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is put off while a
+        // submission is in flight, and what is due stays due.
+        let flying = crate::host::submissions_in_flight();
+        if flying > 0 && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[2].fetch_add(1, Relaxed);
+            }
             return 0;
         }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1724,6 +1834,21 @@ impl HostHeap {
                 self.keep(slot, m.kept);
                 remade += 1;
             }
+        }
+        let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
+        if flying > 0 {
+            VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
+        }
+        // Said at every 1,024 slots made again.
+        if (before + remade as u64) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
+                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade as u64,
+                VIEWS_REMADE[1].load(Relaxed),
+                VIEWS_REMADE[2].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
         }
         remade
     }
@@ -3105,8 +3230,20 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered view in a format the host cannot store to removes
+    // the device when made (an NVIDIA card's B5G5R5A1_UNORM, in the
+    // texture's own format too; after Marvisak ea488a9f, #2462): it is not
+    // made, as other views the host does not allow, and its slot stays
+    // null. The format checked is the one the view is made in.
+    let stores = |made: u32| {
+        let ok = !unordered || typed_store(made);
+        if !ok {
+            once!(view = made, own, "an unordered view in a format the host cannot store to");
+        }
+        ok
+    };
     if view == 0 {
-        return !typeless;
+        return !typeless && stores(own);
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -3114,19 +3251,45 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return stores(own);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
     }
-    if let Some(format) = format
-        && !typeless
-        && !keeps_gamma_view(own, view, unordered)
-    {
+    let own_format = !typeless && !keeps_gamma_view(own, view, unordered);
+    if own_format && let Some(format) = format {
         *format = d.Format;
     }
-    true
+    stores(if own_format { own } else { view })
+}
+
+/// Whether the host makes typed unordered views of `format` (asked once a
+/// format).
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a structure of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
 }
 
 /// Whether a shader view in format `view` of a typed texture in format
@@ -4051,6 +4214,31 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+    /// Slots looked at before and slots never looked at are served in
+    /// turns, one looked at before first: a pass that can take only some
+    /// of a backlog of slots streaming in a part at a time still reaches
+    /// the slots never looked at.
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        // Slots 100..110 looked at before (their memory not there yet).
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due(u64::MAX, 100).iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        // Slots 1..4 never looked at.
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        let order: Vec<u32> = q.due(10, 6).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
+    }
+
     /// Slots held back for lack of room on the card are not handed out
     /// until their frame, keep their place, are not counted as waiting
     /// for their memory, and all come back at once when the card has room;
@@ -4716,6 +4904,26 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn capped_dynamic_slots_stay_between_the_floor_and_half_the_heap() {
+        let null = PORTABLE_VIEWS - 1;
+        // Unset or not a count: the floor.
+        assert_eq!(capped_dynamic_slots(None, null), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(Some("lots"), null), DYNAMIC);
+        // Below the floor: the floor.
+        assert_eq!(capped_dynamic_slots(Some("65536"), null), DYNAMIC);
+        // Within bounds: as asked.
+        assert_eq!(capped_dynamic_slots(Some(" 400000 "), null), 400_000);
+        // Above half the heap: half the heap.
+        assert_eq!(capped_dynamic_slots(Some("524288"), null), null / 2);
+        // A heap too small to give half: still the floor, never less.
+        assert_eq!(capped_dynamic_slots(Some("524288"), DYNAMIC), DYNAMIC);
+        // Hosts that do not cap their view heaps, and sampler heaps, keep
+        // the floor whatever is asked.
+        assert_eq!(dynamic_slots(0), DYNAMIC);
+        assert_eq!(dynamic_slots(PORTABLE_VIEWS), DYNAMIC);
     }
 
     #[test]
