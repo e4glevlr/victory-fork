@@ -65,6 +65,10 @@ pub(crate) struct Shader {
     /// ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// Its part in the estimated stand-in for indirect light
+    /// ([`crate::ambient_sh`], compute programs only).
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient_sh::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -122,6 +126,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 resolves_light: crate::ambient::resolves(bytes),
                 #[cfg(windows)]
+                ambient: (stage == "compute").then(|| crate::ambient_sh::role(bytes)).flatten(),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
@@ -143,6 +149,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         resolves_light: crate::ambient::resolves(container),
+        ambient: (stage == "compute").then(|| crate::ambient_sh::role(container)).flatten(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
     });

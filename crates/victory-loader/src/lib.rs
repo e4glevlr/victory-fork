@@ -24,6 +24,10 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+// Opt-in code patches for one known build: VICTORY_NO_WATCHDOG,
+// VICTORY_OWN_UPSCALER, VICTORY_RENDER_SCALE (all off unless set).
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

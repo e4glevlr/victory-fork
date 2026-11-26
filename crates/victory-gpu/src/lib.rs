@@ -42,6 +42,8 @@ mod host;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod ambient_sh;
+#[cfg(windows)]
 mod over;
 #[cfg(windows)]
 mod indirect;

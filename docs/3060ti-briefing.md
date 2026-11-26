@@ -165,3 +165,51 @@ $env:VICTORY_INDIRECT_WINDOW = "1"
 target\release\victory.exe run <game_dir>\<title.exe> --execute
 ```
 *(Ensure Windows Pagefile is ≥ 24–32 GB on an NVMe SSD to avoid `error 1455` on 16 GB RAM.)*
+
+---
+
+## 7. Grand Merge (`rtx3060ti/grand-merge`, from `main` @ `8a63f368`) — What Landed
+
+Executed from [docs/rtx3060ti-merge-plan.md](rtx3060ti-merge-plan.md), one commit per phase, each after the full gate (Windows-target check, diagnostics check, clippy `-D warnings` default and all features, cross-platform tests, `cargo xtask policy`, `cargo xtask viz`). Windows-only tests (victory-gpu, `semantics_tests`, `valu_tests`) were built and linted on macOS, **not run**: pc-home was offline. Run `cargo test --workspace` on Windows before relying on any of this.
+
+### Switches (default in **bold**)
+
+| Switch | Default | What |
+|---|---|---|
+| `VICTORY_TEXTURE_BACK` | **on** (`0` off) | water textures shaders write are read back into title memory (#999; boats float) |
+| `VICTORY_TARGET_VARIANTS` | **on** (`0` off) | a pipeline made for the render-target formats actually bound |
+| `VICTORY_FAIR_DUE` | **on** (`0` off) | texture queue serves looked-at and fresh slots in turns (#1246) |
+| `VICTORY_RELOOK_MS` | **20000** | re-look interval for slots without memory (#1246) |
+| `VICTORY_BIND_CACHE` | **on** (`0` off) | same render targets are not set again |
+| `VICTORY_DECLARE_ONCE` | **on** (`0` off) | a shader-written range is declared once until the list writes title memory |
+| `VICTORY_DYNAMIC_SLOTS` | off | more dynamic slots on NVIDIA's capped view heap (clamped to half the heap) |
+| `VICTORY_VIEWS_REMADE_QUIET` | off | levels-on-demand view slots remade only with no submission in flight |
+| `VICTORY_LOOKUP_CACHE` | off (`1`, `alt`) | per-thread buffer lookup cache (#1237 + #1245) |
+| `VICTORY_RAM_TRIM_MB` | off | below that much free RAM or commit, reuse pools are emptied |
+| `VICTORY_READBACK_COALESCE` | off | contiguous readback pieces in one copy (#1230) |
+| `VICTORY_CHANGED_RUNS_AVX2` | off | AVX2 changed-run detection (#1233) |
+| `VICTORY_SHADER_OPT` bit 128 (`WIDE`) | off (`255` on) | scalar buffer loads four dwords a call |
+| `VICTORY_AMBIENT` | off | `0.6`: flat stand-in (as before); `sh`/`auto`/`sh:<share>`: estimated SH1 stand-in; `constant:<l>` |
+| `VICTORY_NO_WATCHDOG`, `VICTORY_OWN_UPSCALER`, `VICTORY_RENDER_SCALE` | off | loader code patches for the 1.0.2.1 build only (hash and bytes checked) |
+
+New shader lowering (always on, exact): DP4A `dot4AddPacked` for `v_dot4*`/`v_dot2*` (#808), packed 16-bit saturating clamp (#1042), reverse-postorder `resource::track` (#1041), f16 inline constants in wave sums, `image_get_lod` on cubes, NaN payloads in typed half loads, inactive `ds_swizzle` sources read 0 (console wave32 only).
+
+### Deliberately not ported (see the phase commit messages for detail)
+
+- `#1026` legacy MAD/MAC fused with flushed sources: unmerged in both upstreams; the semantics reference here and in Marvisak/VIctory still takes it unfused. Needs a hardware measurement first.
+- `#1240`'s `VICTORY_TEXTURE_MAX_DIM` (drops detail), its staging zero-fill skip (stale bytes where tiles are mapped) and its batched descriptor mirror (a rewrite of `mirror()`, which differs here).
+- `NV 350c6864` (`VICTORY_UPLOAD_AHEAD`, with `SHOW_AFTER`/`KEEP_SHOWN` around it): 654 lines needing `popwatch.rs`, `texture/ahead.rs` and `crate::ab`, none of which exist here; nearly every hunk fails. Deferred to its own PR.
+- Already in this tree, so not ported again: depth bounds (`c96b4f2b`), integer targets unblended (`e92dbb41`), a null view's alias source.
+- Not applicable here: Marvisak `e815cef2`, `366a9786`, `120233cf`, `136e39d0`; fxceless `d03859a2`.
+
+### Launcher
+
+`scripts/run-3060ti.ps1` (`-Profile Quality` default, `-Profile Survival8GB`, `-SeriesS`, `-DryRun`). Two deviations from the plan's sign-off profile:
+- `VICTORY_DYNAMIC_SLOTS` is not set by default (`-DynamicSlots 524288`): shaders clamp view indices only to the heap's null slot, so a view picked by index past the slots kept in place reads a dynamic slot. Use it only if the log shows "no free dynamic descriptor slots", and compare the picture.
+- `VICTORY_RAM_TRIM_MB` is `2048`, not `12288`: it is a threshold of *available* memory, and a 16 GB machine running the title is nearly always below 12 GB available, which would empty the pools every 500 ms.
+
+### Still to verify on the RTX 3060 Ti
+
+1. `cargo test --workspace` (incl. `byte_dot_products_match_the_hardware`, the new victory-gpu and shader tests).
+2. A/B with `scripts/bench.ps1` against `8a63f368`: default switches vs `-Switches 'VICTORY_BIND_CACHE=0,VICTORY_DECLARE_ONCE=0,VICTORY_TARGET_VARIANTS=0'`.
+3. Visual checks: first-room walls, faces/mouths, glass depth order, HUD glyphs, ocean/boat buoyancy (texback default on).
