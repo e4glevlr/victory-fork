@@ -2946,6 +2946,18 @@ impl State {
                         {
                             shadow.refresh(list, address, u64::from(aligned_size));
                             host.constant_at(index, shadow.gpu(address), size);
+                        } else if crate::host::fill_on_card()
+                            && crate::host::late()
+                            && size > 0
+                            && size <= 65536
+                            && crate::host::flights_write(address as usize, address as usize + size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && let Some(gpu) = {
+                                shadow.refresh(list, address, u64::from(size));
+                                list.card_constants(&shadow, address, u64::from(size))
+                            }
+                        {
+                            host.constant_at(index, gpu, size);
                         } else {
                             let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                                 host.make_null(index);
