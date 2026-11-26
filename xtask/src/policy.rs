@@ -15,6 +15,7 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "svg",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -235,6 +236,16 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("docs/diagram.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>\n").is_empty());
+    }
+
+    #[test]
+    fn rejects_svg_with_embedded_data() {
+        let embedded = format!(
+            "<svg><image href=\"data:image/png;base64,{}\"/></svg>",
+            "A".repeat(600)
+        );
+        assert!(!check("docs/bad.svg", embedded.as_bytes()).is_empty());
     }
 
     #[test]
@@ -295,5 +306,20 @@ mod tests {
             table.join(",\n    ")
         );
         assert!(check("src/table.rs", src.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn accepts_clean_svg_and_rejects_embedded_binary() {
+        let clean = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><rect width=\"100\" height=\"100\"/></svg>\n";
+        assert!(check("docs/repo-visualization.svg", clean).is_empty());
+
+        let smuggled = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"data:image/png;base64,{}\"/></svg>",
+            "A1B2".repeat(200)
+        );
+        assert!(
+            !check("docs/repo-visualization.svg", smuggled.as_bytes()).is_empty(),
+            "base64 payload inside SVG must still be rejected"
+        );
     }
 }

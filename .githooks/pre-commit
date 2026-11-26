@@ -1,3 +1,8 @@
 #!/bin/sh
-# Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
+# Updates the README visualization and enforces the asset policy on every commit.
+# Install with: cargo xtask install-hooks
+set -e
+if [ "${VICTORY_SKIP_VIZ:-0}" != "1" ] && ! git diff --cached --quiet; then
+    cargo xtask viz --pre-commit --stage
+fi
 exec cargo xtask policy --staged

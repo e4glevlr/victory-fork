@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod viz;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,7 +25,20 @@ enum Cmd {
         #[arg(long)]
         staged: bool,
     },
-    /// Point git at .githooks/ so every commit runs the policy check.
+    /// Generate the SVG architecture and telemetry visualization for README.md.
+    Viz {
+        /// Output path relative to the workspace root (default: docs/repo-visualization.svg).
+        #[arg(long, default_value = viz::DEFAULT_OUTPUT)]
+        output: PathBuf,
+        /// Account for the commit currently being created (used by pre-commit).
+        #[arg(long)]
+        pre_commit: bool,
+        /// Stage the updated SVG file with `git add` after writing it.
+        #[arg(long)]
+        stage: bool,
+    },
+    /// Point git at .githooks/ so every commit updates the README visualization
+    /// and runs the policy check.
     InstallHooks,
 }
 
@@ -32,6 +46,18 @@ fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Viz {
+            output,
+            pre_commit,
+            stage,
+        } => {
+            let full = if output.is_absolute() {
+                output
+            } else {
+                root.join(output)
+            };
+            viz::run(&root, &full, pre_commit, stage)
+        }
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -42,7 +68,10 @@ fn main() -> Result<()> {
                 status.success(),
                 "git config failed (is this a git repository?)"
             );
-            println!("hooks installed: commits now run `cargo xtask policy --staged`");
+            println!(
+                "hooks installed: commits now refresh {} and run `cargo xtask policy --staged`",
+                viz::DEFAULT_OUTPUT
+            );
             Ok(())
         }
     }

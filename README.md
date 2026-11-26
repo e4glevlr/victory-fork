@@ -10,6 +10,12 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+<p align="center">
+  <img src="docs/repo-visualization.svg" alt="VIctory Fork Architecture and Live Telemetry" width="100%">
+</p>
+
+> Updated automatically on every commit via `.githooks/pre-commit` (`cargo xtask install-hooks`, or run `cargo xtask viz` manually).
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
