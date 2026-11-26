@@ -228,9 +228,9 @@ pub fn track(
     // copy) when a lower-indexed consumer runs first (VIC-BT-024 / #1249).
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -238,7 +238,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -415,8 +415,8 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    /// The instruction of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -1117,8 +1117,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1126,9 +1126,25 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach the access and run it (its EXEC guard)
+        // read the descriptor (after codec-d/cool_fox f4b48ad7).
+        let mut known = self.access_lanes(at);
         self.classify(&words, &mut Vec::new(), &mut known)
+    }
+
+    /// What holds in every lane that runs the vector instruction at `at`:
+    /// it reaches the block, and its EXEC guard there, if any, is set. A
+    /// lane that left by an edge the access is guarded against never reads
+    /// what that edge brings ([`Self::only_edge`]).
+    fn access_lanes(&self, at: Site) -> Known {
+        let Some(lanes) = self.lanes else {
+            return Vec::new();
+        };
+        let mut known = vec![(lanes.reach[at.0], true)];
+        if let Some(&Some(guard)) = lanes.guards.get(at.0).and_then(|g| g.get(at.1)) {
+            known.push((guard, true));
+        }
+        known
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1276,10 +1292,10 @@ impl<'a> Tracer<'a> {
     /// `t` as the lanes that reach the access being traced hold it: through
     /// joins they can have entered by one edge only ([`Self::only_edge`]).
     fn live(&self, mut t: Term) -> Term {
-        let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
+        let (Some(at), Some(_)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = self.access_lanes(at);
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -3887,6 +3903,47 @@ pub(crate) mod tests {
                 load: (2, 0),
                 first: 0,
             }
+        );
+    }
+
+    /// After codec-d/cool_fox f4b48ad7: lanes that fail `v_cmp_gt_u32` clear
+    /// EXEC and take `s_cbranch_execz` to the join without building the
+    /// immediate sampler `s[8:11]`; the join's `image_sample_lz` is guarded
+    /// by EXEC, so only the arm that built it runs the sample.
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000,    // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00,    // v_cvt_f32_u32 v2, v0
+            0x7E06_0302,    // v_mov_b32 v3, v2
+            0x7D88_0090,    // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E,    // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004,    // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380,    // s_mov_b32 s8, 0
+            0xBE89_0380,    // s_mov_b32 s9, 0
+            0xBE8A_0380,    // s_mov_b32 s10, 0
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(structured.guards[2][0].is_some(), "the join's access carries an EXEC guard");
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "the guarded join takes the sampler from the arm that runs it: {:?}",
+            r.descriptors
         );
     }
 }
